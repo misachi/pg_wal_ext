@@ -1,0 +1,5 @@
+# pg_wal_ext extension
+comment = 'Read WAL files and possibly generate the SQL from WAL'
+default_version = '1.0'
+module_pathname = '$libdir/pg_wal_ext'
+relocatable = true
