@@ -19,7 +19,7 @@
 
 PG_MODULE_MAGIC;
 
-static char *xlog_type(XLogRecord *record);
+static char *record_type(XLogRecord *record);
 static XLogRecord *get_xlog_record(XLogReaderState *xlogreader, XLogRecPtr targetRecPtr);
 
 Datum pg_xlog_records(PG_FUNCTION_ARGS);
@@ -146,38 +146,17 @@ static void split_path(const char *path, char **dir, char **fname)
     }
 }
 
-// Dummy function to return WAL record type -- it only works for heap related records for now
-// Later it will be cleaned up and fixed for all record types
-static char *xlog_type(XLogRecord *record)
+static char *record_type(XLogRecord *record)
 {
-#define STR_LEN 100
+    RmgrData rmgr = RmgrTable[record->xl_rmid];
     uint8 info = record->xl_info & ~XLR_INFO_MASK;
     char *ret = NULL;
     int size;
-    char val[STR_LEN];
+    char *val = rmgr.rm_identify(info);
 
-    switch (info & XLOG_HEAP_OPMASK)
+    if (!val)
     {
-    case XLOG_HEAP_INSERT:
-        snprintf(val, STR_LEN, "INSERT");
-        break;
-    case XLOG_HEAP_DELETE:
-        snprintf(val, STR_LEN, "DELETE");
-        break;
-    case XLOG_HEAP_UPDATE:
-        snprintf(val, STR_LEN, "UPDATE");
-        break;
-    case XLOG_HEAP_HOT_UPDATE:
-        snprintf(val, STR_LEN, "HOT UPDATE");
-        break;
-    case XLOG_HEAP_TRUNCATE:
-        snprintf(val, STR_LEN, "TRUNCATE");
-        break;
-    case XLOG_HEAP_LOCK:
-        snprintf(val, STR_LEN, "LOCK");
-        break;
-    default:
-        snprintf(val, STR_LEN, "unknown op code");
+        val = "unknown op code";
     }
 
     size = strlen(val);
@@ -259,7 +238,7 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
             }
 
             values[0] = Int32GetDatum(i);
-            temp_type = xlog_type(record);
+            temp_type = record_type(record);
             values[1] = CStringGetTextDatum(temp_type);
 
             tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
