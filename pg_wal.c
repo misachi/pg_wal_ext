@@ -152,7 +152,7 @@ static char *record_type(XLogRecord *record)
     uint8 info = record->xl_info & ~XLR_INFO_MASK;
     char *ret = NULL;
     int size;
-    char *val = rmgr.rm_identify(info);
+    const char *val = rmgr.rm_identify(info);
 
     if (!val)
     {
@@ -160,11 +160,12 @@ static char *record_type(XLogRecord *record)
     }
 
     size = strlen(val);
-    ret = palloc(size);
+    ret = palloc(size + 1);
     if (!ret)
     {
         return NULL;
     }
+    ret[size] = '\0';
     memcpy(ret, val, size);
     return ret;
 }
@@ -189,7 +190,6 @@ static int read_xlog_page(XLogReaderState *xlogreader, XLogRecPtr targetPagePtr,
 
     if (!XLogReaderValidatePageHeader(xlogreader, targetRecPtr, (char *)hdr))
     {
-
         elog(ERROR, "Invalid page header errorMsg: %s, page off: %u, recPtr: %zu, pagePtr: %zu, pageArr: %zu, info: %u, rem length: %u", xlogreader->errormsg_buf, target_page_off, targetRecPtr, targetPagePtr, hdr->xlp_pageaddr, hdr->xlp_info, hdr->xlp_rem_len);
     }
 
@@ -200,7 +200,6 @@ static int read_xlog_page(XLogReaderState *xlogreader, XLogRecPtr targetPagePtr,
     xlogreader->readLen = read_len;
 
     close(fd);
-    elog(INFO, "Page Addr: %zu", hdr->xlp_pageaddr);
     return read_len;
 }
 
@@ -220,21 +219,19 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
     XLogSegNoOffsetToRecPtr(seg_no, 0, wal_segment_size, start_lsn);
     temp_lsn = start_lsn;
 
-    Assert(!XLogRecPtrIsInvalid(end_lsn));
-
     num_pages = wal_segment_size / XLOG_BLCKSZ;
     for (size_t i = 0; i < num_pages; i++)
     {
-        end_lsn = temp_lsn + XLOG_BLCKSZ;
         page_ptr = temp_lsn - (temp_lsn % XLOG_BLCKSZ);
+        end_lsn = page_ptr + XLOG_BLCKSZ;
         xlog_reader->routine.page_read(xlog_reader, page_ptr, XLOG_BLCKSZ, page_ptr, xlog_reader->readBuf);
-        while (temp_lsn <= end_lsn)
+        while (temp_lsn < end_lsn)
         {
             record = get_xlog_record(xlog_reader, temp_lsn);
             if (!record)
             {
-                elog(INFO, "Start_LSN: %zu END_LSN: %zu", temp_lsn, end_lsn);
-                break;
+                elog(INFO, "Current_LSN: %zu END_LSN: %zu", temp_lsn, end_lsn);
+                goto end;
             }
 
             values[0] = Int32GetDatum(i);
@@ -248,6 +245,7 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
             Assert(!XLogRecPtrIsInvalid(temp_lsn));
         }
     }
+end:
 }
 
 static XLogRecord *get_xlog_record(XLogReaderState *xlogreader, XLogRecPtr targetRecPtr)
@@ -257,7 +255,7 @@ static XLogRecord *get_xlog_record(XLogReaderState *xlogreader, XLogRecPtr targe
     XLogPageHeader hdr = (XLogPageHeader)xlogreader->readBuf;
     uint32 page_hdr_size = XLogPageHeaderSize(hdr);
     uint32 len;
-    XLogRecPtr page_ptr = targetRecPtr - (targetRecPtr % XLOG_BLCKSZ);
+    XLogRecPtr page_ptr;
     uint32 rec_len;
     char *buf;
 
@@ -274,25 +272,51 @@ static XLogRecord *get_xlog_record(XLogReaderState *xlogreader, XLogRecPtr targe
 
     len = XLOG_BLCKSZ - (targetRecPtr % XLOG_BLCKSZ); // Get remaining size of page
     record = (XLogRecord *)(xlogreader->readBuf + (targetRecPtr % XLOG_BLCKSZ));
+
+start:
+    page_ptr = targetRecPtr - (targetRecPtr % XLOG_BLCKSZ);
     rec_len = record->xl_tot_len;
     xlogreader->currRecPtr = targetRecPtr;
     Assert(record->xl_tot_len > 0);
     xlogreader->NextRecPtr = targetRecPtr + MAXALIGN(rec_len);
+    len = XLOG_BLCKSZ - (targetRecPtr % XLOG_BLCKSZ); // Get remaining size of page
 
     if (rec_len > len)
     {
         elog(INFO, "Record crosses page boundary");
         page_ptr += XLOG_BLCKSZ; // Get next page to retrieve remaining data
         memcpy(xlogreader->readRecordBuf, (char *)record, len);
+        rec_len = record->xl_tot_len;
         xlogreader->routine.page_read(xlogreader, page_ptr, XLOG_BLCKSZ, targetRecPtr + len, xlogreader->readBuf);
         hdr = (XLogPageHeader)xlogreader->readBuf;
+
+        if (hdr->xlp_info & XLP_FIRST_IS_OVERWRITE_CONTRECORD)
+        {
+            xlogreader->overwrittenRecPtr = targetRecPtr;
+            targetRecPtr = page_ptr;
+            goto start;
+        }
+
+        if (!(hdr->xlp_info & XLP_FIRST_IS_CONTRECORD))
+        {
+            report_invalid_record(xlogreader,
+                                  "Invalid contrecord flag at %X/%X",
+                                  LSN_FORMAT_ARGS(targetRecPtr));
+            elog(INFO, "contrecord: %s", xlogreader->errormsg_buf);
+            return NULL;
+        }
         page_hdr_size = XLogPageHeaderSize(hdr);
         Assert(xlogreader->readRecordBufSize >= len);
         Assert(hdr->xlp_rem_len == (rec_len - len));
+        if (hdr->xlp_rem_len != (rec_len - len))
+        {
+            elog(INFO, "Header remaining size and record size do not match ==> Header: %u, Record: %u", hdr->xlp_rem_len, len);
+            return NULL;
+        }
+
         buf = xlogreader->readBuf + page_hdr_size;
         memcpy((char *)&xlogreader->readRecordBuf[len], buf, hdr->xlp_rem_len);
         record = (XLogRecord *)xlogreader->readRecordBuf;
-        // elog(INFO, "Header rem: %u, sub: %u, prev: %zu, info: %u, crc: %u, totallen: %u", hdr->xlp_rem_len, rec_len - len, record->xl_prev, record->xl_info, record->xl_crc, record->xl_tot_len);
         xlogreader->NextRecPtr = targetRecPtr + len + page_hdr_size + MAXALIGN(hdr->xlp_rem_len);
     }
 
@@ -304,11 +328,13 @@ static XLogRecord *get_xlog_record(XLogReaderState *xlogreader, XLogRecPtr targe
 
     if (!ValidXLogRecordHeader(xlogreader, targetRecPtr, xlogreader->DecodeRecPtr, record, false))
     {
-        elog(INFO, "Invalid record header errorMsg: %s, crc: %u", xlogreader->errormsg_buf, record->xl_crc);
+        elog(INFO, "Invalid record header ==> errorMsg: %s", xlogreader->errormsg_buf);
     }
 
     if (!ValidXLogRecord(xlogreader, record, targetRecPtr))
-        elog(INFO, "Invalid record");
+    {
+        elog(INFO, "Invalid record ==> errorMsg: %s", xlogreader->errormsg_buf);
+    }
 
     xlogreader->DecodeRecPtr = targetRecPtr;
 
