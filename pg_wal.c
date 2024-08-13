@@ -1,6 +1,7 @@
 #include <unistd.h>
 
 #include "postgres.h"
+#include "access/commit_ts.h"
 #include "access/transam.h"
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
@@ -21,103 +22,12 @@ PG_MODULE_MAGIC;
 
 static char *record_type(XLogRecord *record);
 static XLogRecord *get_xlog_record(XLogReaderState *xlogreader, XLogRecPtr targetRecPtr);
+extern DecodedXLogRecord *XLogReadRecordAlloc(XLogReaderState *state, size_t xl_tot_len, bool allow_oversized);
+extern void report_invalid_record(XLogReaderState *state, const char *fmt, ...);
+extern bool ValidXLogRecordHeader(XLogReaderState *state, XLogRecPtr RecPtr, XLogRecPtr PrevRecPtr, XLogRecord *record, bool randAccess);
+extern bool ValidXLogRecord(XLogReaderState *state, XLogRecord *record, XLogRecPtr recptr);
 
 Datum pg_xlog_records(PG_FUNCTION_ARGS);
-
-static void
-report_invalid_record(XLogReaderState *state, const char *fmt, ...) // xlogreader.c
-{
-#define MAX_ERRORMSG_LEN 1000
-    va_list args;
-
-    fmt = _(fmt);
-
-    va_start(args, fmt);
-    vsnprintf(state->errormsg_buf, MAX_ERRORMSG_LEN, fmt, args);
-    va_end(args);
-
-    state->errormsg_deferred = true;
-}
-
-static bool
-ValidXLogRecordHeader(XLogReaderState *state, XLogRecPtr RecPtr,
-                      XLogRecPtr PrevRecPtr, XLogRecord *record,
-                      bool randAccess) // xlogreader.c
-{
-    if (record->xl_tot_len < SizeOfXLogRecord)
-    {
-        report_invalid_record(state,
-                              "invalid record length at %X/%X: expected at least %u, got %u",
-                              LSN_FORMAT_ARGS(RecPtr),
-                              (uint32)SizeOfXLogRecord, record->xl_tot_len);
-        return false;
-    }
-    if (!RmgrIdIsValid(record->xl_rmid))
-    {
-        report_invalid_record(state,
-                              "invalid resource manager ID %u at %X/%X",
-                              record->xl_rmid, LSN_FORMAT_ARGS(RecPtr));
-        return false;
-    }
-    if (randAccess)
-    {
-        /*
-         * We can't exactly verify the prev-link, but surely it should be less
-         * than the record's own address.
-         */
-        if (!(record->xl_prev < RecPtr))
-        {
-            report_invalid_record(state,
-                                  "record with incorrect prev-link %X/%X at %X/%X",
-                                  LSN_FORMAT_ARGS(record->xl_prev),
-                                  LSN_FORMAT_ARGS(RecPtr));
-            return false;
-        }
-    }
-    else
-    {
-        /*
-         * Record's prev-link should exactly match our previous location. This
-         * check guards against torn WAL pages where a stale but valid-looking
-         * WAL record starts on a sector boundary.
-         */
-        if (record->xl_prev != PrevRecPtr)
-        {
-            report_invalid_record(state,
-                                  "record with incorrect prev-link %X/%X at %X/%X",
-                                  LSN_FORMAT_ARGS(record->xl_prev),
-                                  LSN_FORMAT_ARGS(RecPtr));
-            return false;
-        }
-    }
-
-    return true;
-}
-
-static bool
-ValidXLogRecord(XLogReaderState *state, XLogRecord *record, XLogRecPtr recptr) // xlogreader.c
-{
-    pg_crc32c crc;
-
-    Assert(record->xl_tot_len >= SizeOfXLogRecord);
-
-    /* Calculate the CRC */
-    INIT_CRC32C(crc);
-    COMP_CRC32C(crc, ((char *)record) + SizeOfXLogRecord, record->xl_tot_len - SizeOfXLogRecord);
-    /* include the record header last */
-    COMP_CRC32C(crc, (char *)record, offsetof(XLogRecord, xl_crc));
-    FIN_CRC32C(crc);
-
-    if (!EQ_CRC32C(record->xl_crc, crc))
-    {
-        report_invalid_record(state,
-                              "incorrect resource manager data checksum in record at %X/%X",
-                              LSN_FORMAT_ARGS(recptr));
-        return false;
-    }
-
-    return true;
-}
 
 typedef struct XLogPageReadPrivate
 {
@@ -213,6 +123,9 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
     XLogRecord *record;
     int num_pages;
     char *temp_type;
+    TransactionId xid;
+    TimestampTz ts;
+    uint8 info;
 
     InitMaterializedSRF(fcinfo, 0);
 
@@ -233,10 +146,24 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
                 elog(INFO, "Current_LSN: %zu END_LSN: %zu", temp_lsn, end_lsn);
                 goto end;
             }
+            xid = record->xl_xid;
+            info = record->xl_info & ~XLR_INFO_MASK;
 
             values[0] = Int32GetDatum(i);
+
+            values[1] = TransactionIdGetDatum(xid);
+
             temp_type = record_type(record);
-            values[1] = CStringGetTextDatum(temp_type);
+            values[2] = CStringGetTextDatum(temp_type);
+
+            if (TransactionIdIsValid(xid) && TransactionIdGetCommitTsData(xid, &ts, NULL) && record->xl_rmid == RM_HEAP_ID && (info == XLOG_HEAP_INSERT || info == XLOG_HEAP_DELETE || info == XLOG_HEAP_UPDATE))
+            {
+                values[3] = TimestampTzGetDatum(ts);
+            }
+            else
+            {
+                nulls[3] = true;
+            }
 
             tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 
@@ -251,14 +178,18 @@ end:
 static XLogRecord *get_xlog_record(XLogReaderState *xlogreader, XLogRecPtr targetRecPtr)
 {
     XLogRecord *record;
-    uint32 rec_off = targetRecPtr % XLOG_BLCKSZ;
+    uint32 rec_off;
     XLogPageHeader hdr = (XLogPageHeader)xlogreader->readBuf;
     uint32 page_hdr_size = XLogPageHeaderSize(hdr);
     uint32 len;
     XLogRecPtr page_ptr;
     uint32 rec_len;
     char *buf;
+    DecodedXLogRecord *decoded;
+    char *errormsg;
 
+start:
+    rec_off = targetRecPtr % XLOG_BLCKSZ;
     if (rec_off == 0)
     {
         targetRecPtr += page_hdr_size;
@@ -270,57 +201,76 @@ static XLogRecord *get_xlog_record(XLogReaderState *xlogreader, XLogRecPtr targe
         return NULL;
     }
 
-    len = XLOG_BLCKSZ - (targetRecPtr % XLOG_BLCKSZ); // Get remaining size of page
     record = (XLogRecord *)(xlogreader->readBuf + (targetRecPtr % XLOG_BLCKSZ));
 
-start:
     page_ptr = targetRecPtr - (targetRecPtr % XLOG_BLCKSZ);
     rec_len = record->xl_tot_len;
     xlogreader->currRecPtr = targetRecPtr;
     Assert(record->xl_tot_len > 0);
     xlogreader->NextRecPtr = targetRecPtr + MAXALIGN(rec_len);
-    len = XLOG_BLCKSZ - (targetRecPtr % XLOG_BLCKSZ); // Get remaining size of page
+    len = XLOG_BLCKSZ - (targetRecPtr % XLOG_BLCKSZ);
 
     if (rec_len > len)
     {
+        uint32 rem_size = rec_len - len; // Remaining record length we still need to retrieve
+        XLogRecPtr next_ptr = targetRecPtr + len;
+
         elog(INFO, "Record crosses page boundary");
-        page_ptr += XLOG_BLCKSZ; // Get next page to retrieve remaining data
         memcpy(xlogreader->readRecordBuf, (char *)record, len);
-        rec_len = record->xl_tot_len;
-        xlogreader->routine.page_read(xlogreader, page_ptr, XLOG_BLCKSZ, targetRecPtr + len, xlogreader->readBuf);
-        hdr = (XLogPageHeader)xlogreader->readBuf;
-
-        if (hdr->xlp_info & XLP_FIRST_IS_OVERWRITE_CONTRECORD)
+        Assert(xlogreader->readRecordBufSize >= rec_len);
+        while (rem_size > 0)
         {
-            xlogreader->overwrittenRecPtr = targetRecPtr;
-            targetRecPtr = page_ptr;
-            goto start;
+            page_ptr += XLOG_BLCKSZ; // Get next page to retrieve remaining data
+            xlogreader->routine.page_read(xlogreader, page_ptr, XLOG_BLCKSZ, next_ptr, xlogreader->readBuf);
+            hdr = (XLogPageHeader)xlogreader->readBuf;
+
+            // Handling overwritten continuation records
+            if (hdr->xlp_info & XLP_FIRST_IS_OVERWRITE_CONTRECORD)
+            {
+                xlogreader->overwrittenRecPtr = targetRecPtr;
+                targetRecPtr = page_ptr;
+                goto start;
+            }
+
+            if (!(hdr->xlp_info & XLP_FIRST_IS_CONTRECORD))
+            {
+                report_invalid_record(xlogreader,
+                                      "Invalid contrecord flag at %X/%X",
+                                      LSN_FORMAT_ARGS(targetRecPtr));
+                elog(INFO, "contrecord: %s", xlogreader->errormsg_buf);
+                return NULL;
+            }
+            page_hdr_size = XLogPageHeaderSize(hdr);
+            if (rem_size <= (XLOG_BLCKSZ - page_hdr_size) && hdr->xlp_rem_len != (rec_len - len))
+            {
+                elog(INFO, "Header remaining size and record size do not match ==> Header: %u, Record: %u", hdr->xlp_rem_len, len);
+                return NULL;
+            }
+
+            buf = xlogreader->readBuf + page_hdr_size;
+            memcpy((char *)&xlogreader->readRecordBuf[len], buf, hdr->xlp_rem_len);
+
+            // xlp_rem_len holds the remaining size of record, even if it exceeds the size of current page
+            // We need to handle both cases: remaining size fits in current page or exceeds current page and spills to the next page
+            if (hdr->xlp_rem_len <= (XLOG_BLCKSZ - page_hdr_size))
+            {
+                len += hdr->xlp_rem_len;
+                next_ptr += page_hdr_size + MAXALIGN(hdr->xlp_rem_len);
+                rem_size -= hdr->xlp_rem_len;
+            }
+            else
+            {
+                len += XLOG_BLCKSZ - page_hdr_size;
+                next_ptr += XLOG_BLCKSZ;
+                rem_size -= XLOG_BLCKSZ - page_hdr_size;
+            }
         }
 
-        if (!(hdr->xlp_info & XLP_FIRST_IS_CONTRECORD))
-        {
-            report_invalid_record(xlogreader,
-                                  "Invalid contrecord flag at %X/%X",
-                                  LSN_FORMAT_ARGS(targetRecPtr));
-            elog(INFO, "contrecord: %s", xlogreader->errormsg_buf);
-            return NULL;
-        }
-        page_hdr_size = XLogPageHeaderSize(hdr);
-        Assert(xlogreader->readRecordBufSize >= len);
-        Assert(hdr->xlp_rem_len == (rec_len - len));
-        if (hdr->xlp_rem_len != (rec_len - len))
-        {
-            elog(INFO, "Header remaining size and record size do not match ==> Header: %u, Record: %u", hdr->xlp_rem_len, len);
-            return NULL;
-        }
-
-        buf = xlogreader->readBuf + page_hdr_size;
-        memcpy((char *)&xlogreader->readRecordBuf[len], buf, hdr->xlp_rem_len);
         record = (XLogRecord *)xlogreader->readRecordBuf;
-        xlogreader->NextRecPtr = targetRecPtr + len + page_hdr_size + MAXALIGN(hdr->xlp_rem_len);
+        xlogreader->NextRecPtr = next_ptr;
     }
 
-    if (!record->xl_tot_len)
+    if (!rec_len)
     {
         elog(INFO, "Empty record");
         return NULL;
@@ -329,11 +279,34 @@ start:
     if (!ValidXLogRecordHeader(xlogreader, targetRecPtr, xlogreader->DecodeRecPtr, record, false))
     {
         elog(INFO, "Invalid record header ==> errorMsg: %s", xlogreader->errormsg_buf);
+        return NULL;
     }
 
     if (!ValidXLogRecord(xlogreader, record, targetRecPtr))
     {
         elog(INFO, "Invalid record ==> errorMsg: %s", xlogreader->errormsg_buf);
+        return NULL;
+    }
+
+    decoded = XLogReadRecordAlloc(xlogreader, rec_len, false);
+    if (!decoded)
+    {
+        ereport(ERROR,
+                (errcode(ERRCODE_OUT_OF_MEMORY),
+                 errmsg("out of memory"),
+                 errdetail("Failed while allocating space for decoding WAL record")));
+    }
+
+    if (DecodeXLogRecord(xlogreader, decoded, record, targetRecPtr, &errormsg))
+    {
+        decoded->next_lsn = xlogreader->NextRecPtr;
+
+        if (xlogreader->decode_queue_tail)
+            xlogreader->decode_queue_tail->next = decoded;
+        if (!xlogreader->decode_queue_head)
+            xlogreader->decode_queue_head = decoded;
+
+        xlogreader->record = xlogreader->decode_queue_head;
     }
 
     xlogreader->DecodeRecPtr = targetRecPtr;
@@ -345,7 +318,7 @@ start:
 
 Datum pg_xlog_records(PG_FUNCTION_ARGS)
 {
-#define XLOG_FIELD_NUM 2
+#define XLOG_FIELD_NUM 4
     text *xlog_file_name = PG_GETARG_TEXT_PP(0);
     TimeLineID tli;
     XLogSegNo seg_no;

@@ -7,7 +7,7 @@
 -- pg_xlog_records()
 --
 
-CREATE FUNCTION pg_xlog_records(IN xlog_file_path text, OUT page_num int4, OUT xlog_type text)
+CREATE FUNCTION pg_xlog_records(IN xlog_file_path text, OUT page_num int4, OUT txn_id xid, OUT xlog_type text, OUT commit_ts timestamptz)
 RETURNS SETOF record
 AS 'MODULE_PATHNAME', 'pg_xlog_records'
 LANGUAGE C STRICT PARALLEL SAFE;

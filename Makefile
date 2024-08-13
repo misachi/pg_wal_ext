@@ -1,7 +1,8 @@
 MODULE_big = pg_wal_ext
 OBJS = \
         $(WIN32RES) \
-        pg_wal.o
+        pg_wal.o \
+        reader.o
 
 EXTENSION = pg_wal_ext
 DATA = pg_wal_ext--1.0.sql
