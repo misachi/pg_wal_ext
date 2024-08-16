@@ -3,6 +3,7 @@
 #include "postgres.h"
 #include "access/commit_ts.h"
 #include "access/transam.h"
+#include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "access/xlogreader.h"
@@ -124,8 +125,8 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
     int num_pages;
     char *temp_type;
     TransactionId xid;
-    TimestampTz ts;
     uint8 info;
+    xl_xact_commit *xlrec;
 
     InitMaterializedSRF(fcinfo, 0);
 
@@ -147,7 +148,6 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
                 goto end;
             }
             xid = record->xl_xid;
-            info = record->xl_info & ~XLR_INFO_MASK;
 
             values[0] = Int32GetDatum(i);
 
@@ -156,13 +156,22 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
             temp_type = record_type(record);
             values[2] = CStringGetTextDatum(temp_type);
 
-            if (TransactionIdIsValid(xid) && TransactionIdGetCommitTsData(xid, &ts, NULL) && record->xl_rmid == RM_HEAP_ID && (info == XLOG_HEAP_INSERT || info == XLOG_HEAP_DELETE || info == XLOG_HEAP_UPDATE))
+            info = record->xl_info & XLOG_XACT_OPMASK;
+            if (record->xl_rmid == RM_XACT_ID && (info == XLOG_XACT_COMMIT || info == XLOG_XACT_COMMIT_PREPARED))
             {
-                values[3] = TimestampTzGetDatum(ts);
-            }
-            else
-            {
+                xlrec = (xl_xact_commit *)XLogRecGetData(xlog_reader);
+                values[3] = xlrec->xact_time;
+                nulls[3] = false;
+            } else {
+                values[3] = (Datum)0;
                 nulls[3] = true;
+            }
+
+            values[4] = xlog_reader->record->max_block_id;
+
+            if (xlog_reader->record)
+            {
+                /* code */
             }
 
             tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
@@ -187,6 +196,7 @@ static XLogRecord *get_xlog_record(XLogReaderState *xlogreader, XLogRecPtr targe
     char *buf;
     DecodedXLogRecord *decoded;
     char *errormsg;
+    xlogreader->record = NULL;
 
 start:
     rec_off = targetRecPtr % XLOG_BLCKSZ;
@@ -299,14 +309,15 @@ start:
 
     if (DecodeXLogRecord(xlogreader, decoded, record, targetRecPtr, &errormsg))
     {
-        decoded->next_lsn = xlogreader->NextRecPtr;
+        // decoded->next_lsn = xlogreader->NextRecPtr;
 
-        if (xlogreader->decode_queue_tail)
-            xlogreader->decode_queue_tail->next = decoded;
-        if (!xlogreader->decode_queue_head)
-            xlogreader->decode_queue_head = decoded;
+        // if (xlogreader->decode_queue_tail)
+        //     xlogreader->decode_queue_tail->next = decoded;
+        // xlogreader->decode_queue_tail = decoded;
+        // if (!xlogreader->decode_queue_head)
+        //     xlogreader->decode_queue_head = decoded;
 
-        xlogreader->record = xlogreader->decode_queue_head;
+        xlogreader->record = decoded;
     }
 
     xlogreader->DecodeRecPtr = targetRecPtr;
@@ -318,7 +329,7 @@ start:
 
 Datum pg_xlog_records(PG_FUNCTION_ARGS)
 {
-#define XLOG_FIELD_NUM 4
+#define XLOG_FIELD_NUM 5
     text *xlog_file_name = PG_GETARG_TEXT_PP(0);
     TimeLineID tli;
     XLogSegNo seg_no;
@@ -328,7 +339,7 @@ Datum pg_xlog_records(PG_FUNCTION_ARGS)
     char *directory = NULL;
     char *fname = NULL;
     Datum values[XLOG_FIELD_NUM];
-    bool nulls[XLOG_FIELD_NUM] = {0};
+    bool nulls[XLOG_FIELD_NUM] = {false};
     char *path = NULL;
 
     path = text_to_cstring(xlog_file_name);
