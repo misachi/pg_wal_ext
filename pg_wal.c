@@ -10,13 +10,15 @@
 #include "access/xlogrecovery.h"
 #include "access/xlogstats.h"
 #include "access/xlogutils.h"
-#include "access/xlog_internal.h"
-#include "common/logging.h"
 #include "access/htup_details.h"
 #include "access/heapam_xlog.h"
+#include "access/relation.h"
+#include "access/table.h"
+#include "common/logging.h"
+#include "executor/tuptable.h"
 #include "funcapi.h"
 #include "fmgr.h"
-#include "common/fe_memutils.h"
+#include "storage/lmgr.h"
 #include "utils/builtins.h"
 
 PG_MODULE_MAGIC;
@@ -123,10 +125,11 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
     XLogRecPtr page_ptr;
     XLogRecord *record;
     int num_pages;
-    char *temp_type;
+    char *temp_type = NULL;
     TransactionId xid;
-    uint8 info;
+    uint8 info, info2;
     xl_xact_commit *xlrec;
+    Oid relid = DatumGetObjectId(fcinfo->args[1].value);
 
     InitMaterializedSRF(fcinfo, 0);
 
@@ -147,34 +150,167 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
                 elog(INFO, "Current_LSN: %zu END_LSN: %zu", temp_lsn, end_lsn);
                 goto end;
             }
+
             xid = record->xl_xid;
-
-            values[0] = Int32GetDatum(i);
-
-            values[1] = TransactionIdGetDatum(xid);
-
             temp_type = record_type(record);
-            values[2] = CStringGetTextDatum(temp_type);
 
-            info = record->xl_info & XLOG_XACT_OPMASK;
-            if (record->xl_rmid == RM_XACT_ID && (info == XLOG_XACT_COMMIT || info == XLOG_XACT_COMMIT_PREPARED))
+            info = record->xl_info & ~XLR_INFO_MASK;
+            info2 = record->xl_info & XLOG_XACT_OPMASK;
+            if ((xlog_reader->record && record->xl_rmid == RM_HEAP_ID && info == XLOG_HEAP_INSERT) ||
+                (record->xl_rmid == RM_XACT_ID && (info2 == XLOG_XACT_COMMIT || info2 == XLOG_XACT_COMMIT_PREPARED)))
             {
-                xlrec = (xl_xact_commit *)XLogRecGetData(xlog_reader);
-                values[3] = xlrec->xact_time;
-                nulls[3] = false;
-            } else {
-                values[3] = (Datum)0;
-                nulls[3] = true;
+                TupleDesc tup_desc;
+                Relation relation;
+                DecodedBkpBlock *bkp_blk;
+                HeapTupleData tup;
+                HeapTupleHeader header;
+                HeapTupleTableSlot *hslot;
+                size_t datalen;
+                char *tupledata;
+                xl_heap_header xlhdr; // on-disk header
+                int len;
+                StringInfoData buf;
+                TupleTableSlot *slot;
+
+                bkp_blk = &xlog_reader->record->blocks[0];
+
+                relation = try_table_open(relid, AccessShareLock);
+                if (relation && relation->rd_rel->relfilenode != bkp_blk->rlocator.relNumber)
+                {
+                    table_close(relation, AccessShareLock);
+                }
+                else if (relation && relation->rd_rel->relfilenode == bkp_blk->rlocator.relNumber)
+                {
+                    values[0] = Int32GetDatum(i);
+                    values[1] = TransactionIdGetDatum(xid);
+                    values[2] = CStringGetTextDatum(temp_type);
+
+                    if (record->xl_rmid == RM_XACT_ID)
+                    {
+                        table_close(relation, AccessShareLock);
+                        xlrec = (xl_xact_commit *)XLogRecGetData(xlog_reader);
+                        values[3] = xlrec->xact_time;
+                        nulls[3] = false;
+                        values[4] = (Datum)0;
+                        nulls[4] = true;
+                    }
+                    else
+                    {
+                        values[3] = (Datum)0;
+                        nulls[3] = true;
+
+                        // values[4] = Int32GetDatum(xlog_reader->record->max_block_id);
+
+                        tup_desc = RelationGetDescr(relation);
+                        slot = MakeSingleTupleTableSlot(tup_desc, &TTSOpsHeapTuple);
+                        hslot = (HeapTupleTableSlot *)slot;
+                        hslot->tuple = &tup;
+                        tupledata = XLogRecGetBlockData(xlog_reader, 0, &datalen);
+
+                        if (!tupledata)
+                        {
+                            // We check if we have a back'd up block image; we try to restore it back
+                            PGAlignedBlock buf;
+                            Page page;
+                            xl_heap_insert *xlrec;
+                            ItemId lp;
+
+                            page = (Page)buf.data;
+                            if (bkp_blk->has_image)
+                            {
+                                if (!RestoreBlockImage(xlog_reader, 0, page))
+                                    ereport(ERROR,
+                                            (errcode(ERRCODE_INTERNAL_ERROR),
+                                             errmsg_internal("Error restoring block image: %s", xlog_reader->errormsg_buf)));
+                            }
+                            xlrec = (xl_heap_insert *)XLogRecGetData(xlog_reader);
+                            lp = PageGetItemId(page, xlrec->offnum);
+                            header = (HeapTupleHeader)PageGetItem(page, lp);
+                            hslot->tuple->t_data = header;
+                        }
+                        else
+                        {
+                            len = datalen - SizeOfHeapHeader;
+                            hslot->tuple->t_len = len + SizeofHeapTupleHeader;
+                            hslot->tuple->t_data = palloc(hslot->tuple->t_len);
+                            header = hslot->tuple->t_data;
+                            hslot->tuple->t_tableOid = relid;
+
+                            memcpy((char *)&xlhdr, tupledata, SizeOfHeapHeader);
+
+                            memset(header, 0, SizeofHeapTupleHeader);
+
+                            memcpy(((char *)hslot->tuple->t_data) + SizeofHeapTupleHeader, tupledata + SizeOfHeapHeader, len);
+
+                            header->t_infomask = xlhdr.t_infomask;
+                            header->t_infomask2 = xlhdr.t_infomask2;
+                            header->t_hoff = xlhdr.t_hoff;
+                            pfree(hslot->tuple->t_data);
+                        }
+
+                        slot->tts_ops->getsomeattrs(slot, tup_desc->natts);
+
+                        initStringInfo(&buf);
+                        appendStringInfo(&buf, "INSERT INTO %s(", NameStr(relation->rd_rel->relname));
+
+                        for (size_t attnum = 0; attnum < tup_desc->natts; attnum++)
+                        {
+                            Form_pg_attribute thisatt = TupleDescAttr(tup_desc, attnum);
+                            appendStringInfo(&buf, "%s", NameStr(thisatt->attname));
+
+                            if ((attnum + 1) < tup_desc->natts)
+                            {
+                                appendStringInfo(&buf, ",");
+                            }
+                        }
+                        appendStringInfo(&buf, ") VALUES(");
+
+                        for (size_t attnum = 0; attnum < tup_desc->natts; attnum++)
+                        {
+                            Form_pg_attribute thisatt = TupleDescAttr(tup_desc, attnum);
+                            if (!slot->tts_isnull[attnum])
+                            {
+                                if (thisatt->attbyval)
+                                {
+                                    switch (thisatt->attlen)
+                                    {
+                                    case sizeof(char):
+                                        appendStringInfo(&buf, "%d", DatumGetChar(slot->tts_values[attnum]));
+                                        break;
+                                    case sizeof(int16):
+                                        appendStringInfo(&buf, "%i", DatumGetInt16(slot->tts_values[attnum]));
+                                        break;
+                                    case sizeof(int32):
+                                        appendStringInfo(&buf, "%i", DatumGetInt32(slot->tts_values[attnum]));
+                                        break;
+#if SIZEOF_DATUM == 8
+                                    case sizeof(Datum):
+                                        appendStringInfo(&buf, "%s", (char *)slot->tts_values[attnum]);
+                                        break;
+#endif
+                                    default:
+                                        elog(ERROR, "unsupported attribute length: %d", thisatt->attlen);
+                                    }
+                                }
+                                else
+                                    appendStringInfo(&buf, "%s", (char *)slot->tts_values[attnum]);
+
+                                if ((attnum + 1) < tup_desc->natts)
+                                {
+                                    appendStringInfo(&buf, ",");
+                                }
+                            }
+                        }
+                        appendStringInfo(&buf, ");");
+                        values[4] = CStringGetTextDatum(buf.data);
+                        nulls[4] = false;
+
+                        DecrTupleDescRefCount(tup_desc);
+                        table_close(relation, AccessShareLock);
+                    }
+                    tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+                }
             }
-
-            values[4] = xlog_reader->record->max_block_id;
-
-            if (xlog_reader->record)
-            {
-                /* code */
-            }
-
-            tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 
             temp_lsn = xlog_reader->NextRecPtr;
             pfree(temp_type);
@@ -225,7 +361,7 @@ start:
         uint32 rem_size = rec_len - len; // Remaining record length we still need to retrieve
         XLogRecPtr next_ptr = targetRecPtr + len;
 
-        elog(INFO, "Record crosses page boundary");
+        // elog(INFO, "Record crosses page boundary");
         memcpy(xlogreader->readRecordBuf, (char *)record, len);
         Assert(xlogreader->readRecordBufSize >= rec_len);
         while (rem_size > 0)
