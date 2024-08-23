@@ -14,12 +14,14 @@
 #include "access/heapam_xlog.h"
 #include "access/relation.h"
 #include "access/table.h"
+#include "catalog/namespace.h"
 #include "common/logging.h"
 #include "executor/tuptable.h"
 #include "funcapi.h"
 #include "fmgr.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
+#include "utils/lsyscache.h"
 
 PG_MODULE_MAGIC;
 
@@ -131,6 +133,9 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
     xl_xact_commit *xlrec;
     Oid relid = DatumGetObjectId(fcinfo->args[1].value);
 
+    if (!OidIsValid(get_rel_namespace(relid)))
+        elog(ERROR, "Invalid table Oid %u", relid);
+
     InitMaterializedSRF(fcinfo, 0);
 
     XLogSegNoOffsetToRecPtr(seg_no, 0, wal_segment_size, start_lsn);
@@ -171,6 +176,7 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
                 int len;
                 StringInfoData buf;
                 TupleTableSlot *slot;
+                char *nspname;
 
                 bkp_blk = &xlog_reader->record->blocks[0];
 
@@ -250,8 +256,13 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
 
                         slot->tts_ops->getsomeattrs(slot, tup_desc->natts);
 
+                        if (RelationIsVisible(relid))
+                            nspname = NULL;
+                        else
+                            nspname = get_namespace_name(relation->rd_rel->relnamespace);
+
                         initStringInfo(&buf);
-                        appendStringInfo(&buf, "INSERT INTO %s(", NameStr(relation->rd_rel->relname));
+                        appendStringInfo(&buf, "INSERT INTO %s(", quote_qualified_identifier(nspname, RelationGetRelationName(relation)));
 
                         for (size_t attnum = 0; attnum < tup_desc->natts; attnum++)
                         {
