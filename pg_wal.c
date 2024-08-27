@@ -2,6 +2,9 @@
 
 #include "postgres.h"
 #include "access/commit_ts.h"
+#include "access/genam.h"
+#include "access/htup_details.h"
+#include "access/heapam_xlog.h"
 #include "access/transam.h"
 #include "access/xact.h"
 #include "access/xlog.h"
@@ -10,9 +13,8 @@
 #include "access/xlogrecovery.h"
 #include "access/xlogstats.h"
 #include "access/xlogutils.h"
-#include "access/htup_details.h"
-#include "access/heapam_xlog.h"
 #include "access/relation.h"
+#include "access/skey.h"
 #include "access/table.h"
 #include "catalog/namespace.h"
 #include "common/logging.h"
@@ -21,6 +23,7 @@
 #include "fmgr.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 
 PG_MODULE_MAGIC;
@@ -131,10 +134,10 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
     TransactionId xid;
     uint8 info, info2;
     xl_xact_commit *xlrec;
-    Oid relid = DatumGetObjectId(fcinfo->args[1].value);
+    // Oid relid = DatumGetObjectId(fcinfo->args[1].value);
 
-    if (!OidIsValid(get_rel_namespace(relid)))
-        elog(ERROR, "Invalid table Oid %u", relid);
+    // if (!OidIsValid(get_rel_namespace(relid)))
+    //     elog(ERROR, "Invalid table Oid %u", relid);
 
     InitMaterializedSRF(fcinfo, 0);
 
@@ -165,7 +168,7 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
                 (record->xl_rmid == RM_XACT_ID && (info2 == XLOG_XACT_COMMIT || info2 == XLOG_XACT_COMMIT_PREPARED)))
             {
                 TupleDesc tup_desc;
-                Relation relation;
+                Relation relation, rel_rel;
                 DecodedBkpBlock *bkp_blk;
                 HeapTupleData tup;
                 HeapTupleHeader header;
@@ -177,152 +180,172 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
                 StringInfoData buf;
                 TupleTableSlot *slot;
                 char *nspname;
+                ScanKeyData skey;
+                SysScanDesc sscan;
+                Form_pg_class classForm = NULL;
+                HeapTuple tuple = NULL;
 
                 bkp_blk = &xlog_reader->record->blocks[0];
 
-                relation = try_table_open(relid, AccessShareLock);
-                if (relation && relation->rd_rel->relfilenode != bkp_blk->rlocator.relNumber)
+                rel_rel = table_open(RelationRelationId, AccessShareLock);
+                ScanKeyInit(&skey,
+                            Anum_pg_class_relfilenode,
+                            BTEqualStrategyNumber, F_OIDEQ,
+                            ObjectIdGetDatum(bkp_blk->rlocator.relNumber));
+                sscan = systable_beginscan(rel_rel, ClassTblspcRelfilenodeIndexId, true,
+                                           SnapshotSelf, 1, &skey);
+
+                tuple = systable_getnext(sscan);
+                if (!HeapTupleIsValid(tuple))
+                {
+                    systable_endscan(sscan);
+                    table_close(rel_rel, AccessShareLock);
+                    goto l1;
+                }
+
+                classForm = (Form_pg_class)GETSTRUCT(tuple);
+                relation = table_open(classForm->oid, AccessShareLock);
+                values[0] = Int32GetDatum(i);
+                values[1] = TransactionIdGetDatum(xid);
+                values[2] = CStringGetTextDatum(temp_type);
+
+                if (record->xl_rmid == RM_XACT_ID)
                 {
                     table_close(relation, AccessShareLock);
+                    xlrec = (xl_xact_commit *)XLogRecGetData(xlog_reader);
+                    values[3] = xlrec->xact_time;
+                    nulls[3] = false;
+                    values[4] = (Datum)0;
+                    nulls[4] = true;
                 }
-                else if (relation && relation->rd_rel->relfilenode == bkp_blk->rlocator.relNumber)
+                else
                 {
-                    values[0] = Int32GetDatum(i);
-                    values[1] = TransactionIdGetDatum(xid);
-                    values[2] = CStringGetTextDatum(temp_type);
+                    values[3] = (Datum)0;
+                    nulls[3] = true;
 
-                    if (record->xl_rmid == RM_XACT_ID)
+                    // values[4] = Int32GetDatum(xlog_reader->record->max_block_id);
+
+                    tup_desc = RelationGetDescr(relation);
+                    slot = MakeSingleTupleTableSlot(tup_desc, &TTSOpsHeapTuple);
+                    hslot = (HeapTupleTableSlot *)slot;
+                    hslot->tuple = &tup;
+                    tupledata = XLogRecGetBlockData(xlog_reader, 0, &datalen);
+
+                    if (!tupledata)
                     {
-                        table_close(relation, AccessShareLock);
-                        xlrec = (xl_xact_commit *)XLogRecGetData(xlog_reader);
-                        values[3] = xlrec->xact_time;
-                        nulls[3] = false;
-                        values[4] = (Datum)0;
-                        nulls[4] = true;
+                        // We check if we have a back'd up block image; we try to restore it back
+                        PGAlignedBlock buf;
+                        Page page;
+                        xl_heap_insert *xlrec;
+                        ItemId lp;
+
+                        page = (Page)buf.data;
+                        if (bkp_blk->has_image)
+                        {
+                            if (!RestoreBlockImage(xlog_reader, 0, page))
+                                ereport(ERROR,
+                                        (errcode(ERRCODE_INTERNAL_ERROR),
+                                         errmsg_internal("Error restoring block image: %s", xlog_reader->errormsg_buf)));
+                        }
+                        xlrec = (xl_heap_insert *)XLogRecGetData(xlog_reader);
+                        lp = PageGetItemId(page, xlrec->offnum);
+                        header = (HeapTupleHeader)PageGetItem(page, lp);
+                        hslot->tuple->t_data = header;
                     }
                     else
                     {
-                        values[3] = (Datum)0;
-                        nulls[3] = true;
+                        len = datalen - SizeOfHeapHeader;
+                        hslot->tuple->t_len = len + SizeofHeapTupleHeader;
+                        hslot->tuple->t_data = palloc(hslot->tuple->t_len);
+                        header = hslot->tuple->t_data;
+                        hslot->tuple->t_tableOid = classForm->oid;
 
-                        // values[4] = Int32GetDatum(xlog_reader->record->max_block_id);
+                        memcpy((char *)&xlhdr, tupledata, SizeOfHeapHeader);
 
-                        tup_desc = RelationGetDescr(relation);
-                        slot = MakeSingleTupleTableSlot(tup_desc, &TTSOpsHeapTuple);
-                        hslot = (HeapTupleTableSlot *)slot;
-                        hslot->tuple = &tup;
-                        tupledata = XLogRecGetBlockData(xlog_reader, 0, &datalen);
+                        memset(header, 0, SizeofHeapTupleHeader);
 
-                        if (!tupledata)
+                        memcpy(((char *)hslot->tuple->t_data) + SizeofHeapTupleHeader, tupledata + SizeOfHeapHeader, len);
+
+                        header->t_infomask = xlhdr.t_infomask;
+                        header->t_infomask2 = xlhdr.t_infomask2;
+                        header->t_hoff = xlhdr.t_hoff;
+                        pfree(hslot->tuple->t_data);
+                    }
+
+                    slot->tts_ops->getsomeattrs(slot, tup_desc->natts);
+
+                    if (RelationIsVisible(classForm->oid))
+                        nspname = NULL;
+                    else
+                        nspname = get_namespace_name(relation->rd_rel->relnamespace);
+
+                    initStringInfo(&buf);
+                    appendStringInfo(&buf, "INSERT INTO %s(", quote_qualified_identifier(nspname, RelationGetRelationName(relation)));
+
+                    for (size_t attnum = 0; attnum < tup_desc->natts; attnum++)
+                    {
+                        Form_pg_attribute thisatt = TupleDescAttr(tup_desc, attnum);
+                        if (!slot->tts_isnull[attnum])
                         {
-                            // We check if we have a back'd up block image; we try to restore it back
-                            PGAlignedBlock buf;
-                            Page page;
-                            xl_heap_insert *xlrec;
-                            ItemId lp;
-
-                            page = (Page)buf.data;
-                            if (bkp_blk->has_image)
-                            {
-                                if (!RestoreBlockImage(xlog_reader, 0, page))
-                                    ereport(ERROR,
-                                            (errcode(ERRCODE_INTERNAL_ERROR),
-                                             errmsg_internal("Error restoring block image: %s", xlog_reader->errormsg_buf)));
-                            }
-                            xlrec = (xl_heap_insert *)XLogRecGetData(xlog_reader);
-                            lp = PageGetItemId(page, xlrec->offnum);
-                            header = (HeapTupleHeader)PageGetItem(page, lp);
-                            hslot->tuple->t_data = header;
-                        }
-                        else
-                        {
-                            len = datalen - SizeOfHeapHeader;
-                            hslot->tuple->t_len = len + SizeofHeapTupleHeader;
-                            hslot->tuple->t_data = palloc(hslot->tuple->t_len);
-                            header = hslot->tuple->t_data;
-                            hslot->tuple->t_tableOid = relid;
-
-                            memcpy((char *)&xlhdr, tupledata, SizeOfHeapHeader);
-
-                            memset(header, 0, SizeofHeapTupleHeader);
-
-                            memcpy(((char *)hslot->tuple->t_data) + SizeofHeapTupleHeader, tupledata + SizeOfHeapHeader, len);
-
-                            header->t_infomask = xlhdr.t_infomask;
-                            header->t_infomask2 = xlhdr.t_infomask2;
-                            header->t_hoff = xlhdr.t_hoff;
-                            pfree(hslot->tuple->t_data);
-                        }
-
-                        slot->tts_ops->getsomeattrs(slot, tup_desc->natts);
-
-                        if (RelationIsVisible(relid))
-                            nspname = NULL;
-                        else
-                            nspname = get_namespace_name(relation->rd_rel->relnamespace);
-
-                        initStringInfo(&buf);
-                        appendStringInfo(&buf, "INSERT INTO %s(", quote_qualified_identifier(nspname, RelationGetRelationName(relation)));
-
-                        for (size_t attnum = 0; attnum < tup_desc->natts; attnum++)
-                        {
-                            Form_pg_attribute thisatt = TupleDescAttr(tup_desc, attnum);
                             appendStringInfo(&buf, "%s", NameStr(thisatt->attname));
 
-                            if ((attnum + 1) < tup_desc->natts)
+                            if ((attnum + 1) < tup_desc->natts && !slot->tts_isnull[attnum + 1])
                             {
                                 appendStringInfo(&buf, ",");
                             }
                         }
-                        appendStringInfo(&buf, ") VALUES(");
+                    }
+                    appendStringInfo(&buf, ") VALUES(");
 
-                        for (size_t attnum = 0; attnum < tup_desc->natts; attnum++)
+                    for (size_t attnum = 0; attnum < tup_desc->natts; attnum++)
+                    {
+                        Form_pg_attribute thisatt = TupleDescAttr(tup_desc, attnum);
+                        if (!slot->tts_isnull[attnum])
                         {
-                            Form_pg_attribute thisatt = TupleDescAttr(tup_desc, attnum);
-                            if (!slot->tts_isnull[attnum])
+                            if (thisatt->attbyval)
                             {
-                                if (thisatt->attbyval)
+                                switch (thisatt->attlen)
                                 {
-                                    switch (thisatt->attlen)
-                                    {
-                                    case sizeof(char):
-                                        appendStringInfo(&buf, "%d", DatumGetChar(slot->tts_values[attnum]));
-                                        break;
-                                    case sizeof(int16):
-                                        appendStringInfo(&buf, "%i", DatumGetInt16(slot->tts_values[attnum]));
-                                        break;
-                                    case sizeof(int32):
-                                        appendStringInfo(&buf, "%i", DatumGetInt32(slot->tts_values[attnum]));
-                                        break;
+                                case sizeof(char):
+                                    appendStringInfo(&buf, "%d", DatumGetChar(slot->tts_values[attnum]));
+                                    break;
+                                case sizeof(int16):
+                                    appendStringInfo(&buf, "%i", DatumGetInt16(slot->tts_values[attnum]));
+                                    break;
+                                case sizeof(int32):
+                                    appendStringInfo(&buf, "%i", DatumGetInt32(slot->tts_values[attnum]));
+                                    break;
 #if SIZEOF_DATUM == 8
-                                    case sizeof(Datum):
-                                        appendStringInfo(&buf, "%s", (char *)slot->tts_values[attnum]);
-                                        break;
-#endif
-                                    default:
-                                        elog(ERROR, "unsupported attribute length: %d", thisatt->attlen);
-                                    }
-                                }
-                                else
+                                case sizeof(Datum):
                                     appendStringInfo(&buf, "%s", (char *)slot->tts_values[attnum]);
-
-                                if ((attnum + 1) < tup_desc->natts)
-                                {
-                                    appendStringInfo(&buf, ",");
+                                    break;
+#endif
+                                default:
+                                    elog(ERROR, "unsupported attribute length: %d", thisatt->attlen);
                                 }
                             }
-                        }
-                        appendStringInfo(&buf, ");");
-                        values[4] = CStringGetTextDatum(buf.data);
-                        nulls[4] = false;
+                            else
+                                appendStringInfo(&buf, "%s", (char *)slot->tts_values[attnum]);
 
-                        DecrTupleDescRefCount(tup_desc);
-                        table_close(relation, AccessShareLock);
+                            if ((attnum + 1) < tup_desc->natts && !slot->tts_isnull[attnum + 1])
+                            {
+                                appendStringInfo(&buf, ",");
+                            }
+                        }
                     }
-                    tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+                    appendStringInfo(&buf, ");");
+                    values[4] = CStringGetTextDatum(buf.data);
+                    nulls[4] = false;
+
+                    DecrTupleDescRefCount(tup_desc);
+                    table_close(relation, AccessShareLock);
                 }
+                tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+                systable_endscan(sscan);
+                table_close(rel_rel, AccessShareLock);
             }
 
+        l1:
             temp_lsn = xlog_reader->NextRecPtr;
             pfree(temp_type);
             Assert(!XLogRecPtrIsInvalid(temp_lsn));
