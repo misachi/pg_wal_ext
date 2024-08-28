@@ -184,6 +184,9 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
                 SysScanDesc sscan;
                 Form_pg_class classForm = NULL;
                 HeapTuple tuple = NULL;
+                // Silly hack to track null attributes in loop e.g 1000000001 where is_null is
+                // true since by the ith 1 we know there is prev not null attribute, 0000000001 is_null is false
+                bool is_null;
 
                 bkp_blk = &xlog_reader->record->blocks[0];
 
@@ -282,6 +285,7 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
                     initStringInfo(&buf);
                     appendStringInfo(&buf, "INSERT INTO %s(", quote_qualified_identifier(nspname, RelationGetRelationName(relation)));
 
+                    is_null = false;
                     for (size_t attnum = 0; attnum < tup_desc->natts; attnum++)
                     {
                         Form_pg_attribute thisatt = TupleDescAttr(tup_desc, attnum);
@@ -293,10 +297,19 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
                             {
                                 appendStringInfo(&buf, ",");
                             }
+                            is_null = true;
+                        }
+                        else
+                        {
+                            if ((attnum + 1) < tup_desc->natts && !slot->tts_isnull[attnum + 1] && is_null)
+                            {
+                                appendStringInfo(&buf, ",");
+                            }
                         }
                     }
                     appendStringInfo(&buf, ") VALUES(");
 
+                    is_null = false;
                     for (size_t attnum = 0; attnum < tup_desc->natts; attnum++)
                     {
                         Form_pg_attribute thisatt = TupleDescAttr(tup_desc, attnum);
@@ -317,7 +330,7 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
                                     break;
 #if SIZEOF_DATUM == 8
                                 case sizeof(Datum):
-                                    appendStringInfo(&buf, "%s", (char *)slot->tts_values[attnum]);
+                                    appendStringInfo(&buf, "%s", DatumGetPointer(slot->tts_values[attnum]));
                                     break;
 #endif
                                 default:
@@ -325,9 +338,17 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
                                 }
                             }
                             else
-                                appendStringInfo(&buf, "%s", (char *)slot->tts_values[attnum]);
+                                appendStringInfo(&buf, "%s", DatumGetPointer(slot->tts_values[attnum]));
 
                             if ((attnum + 1) < tup_desc->natts && !slot->tts_isnull[attnum + 1])
+                            {
+                                appendStringInfo(&buf, ",");
+                            }
+                            is_null = true;
+                        }
+                        else
+                        {
+                            if ((attnum + 1) < tup_desc->natts && !slot->tts_isnull[attnum + 1] && is_null)
                             {
                                 appendStringInfo(&buf, ",");
                             }
