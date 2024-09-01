@@ -2,8 +2,10 @@
 
 #include "postgres.h"
 #include "access/commit_ts.h"
+#include "access/detoast.h"
 #include "access/genam.h"
 #include "access/htup_details.h"
+#include "access/heaptoast.h"
 #include "access/heapam_xlog.h"
 #include "access/transam.h"
 #include "access/xact.h"
@@ -17,6 +19,7 @@
 #include "access/skey.h"
 #include "access/table.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_type.h"
 #include "common/logging.h"
 #include "executor/tuptable.h"
 #include "funcapi.h"
@@ -27,6 +30,11 @@
 #include "utils/lsyscache.h"
 
 PG_MODULE_MAGIC;
+
+#define CHECK_NEXT_ATTR(tup_desc, attnum, is_null) ( \
+    (attnum + 1) < (tup_desc->natts) && (!is_null[attnum + 1]))
+
+#define CHECK_VALID_OID(tup_desc, attnum) (TupleDescAttr(tup_desc, attnum + 1)->atttypid != InvalidOid)
 
 static char *record_type(XLogRecord *record);
 static XLogRecord *get_xlog_record(XLogReaderState *xlogreader, XLogRecPtr targetRecPtr);
@@ -134,10 +142,6 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
     TransactionId xid;
     uint8 info, info2;
     xl_xact_commit *xlrec;
-    // Oid relid = DatumGetObjectId(fcinfo->args[1].value);
-
-    // if (!OidIsValid(get_rel_namespace(relid)))
-    //     elog(ERROR, "Invalid table Oid %u", relid);
 
     InitMaterializedSRF(fcinfo, 0);
 
@@ -184,9 +188,8 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
                 SysScanDesc sscan;
                 Form_pg_class classForm = NULL;
                 HeapTuple tuple = NULL;
-                // Silly hack to track null attributes in loop e.g 1000000001 where is_null is
-                // true since by the ith 1 we know there is prev not null attribute, 0000000001 is_null is false
-                bool is_null;
+                // Track attributes -> Check if previous attribute was a null/empty, then separate with comma
+                bool prev_exists;
 
                 bkp_blk = &xlog_reader->record->blocks[0];
 
@@ -232,17 +235,18 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
                     slot = MakeSingleTupleTableSlot(tup_desc, &TTSOpsHeapTuple);
                     hslot = (HeapTupleTableSlot *)slot;
                     hslot->tuple = &tup;
+                    hslot->tuple->t_data = NULL;
                     tupledata = XLogRecGetBlockData(xlog_reader, 0, &datalen);
 
                     if (!tupledata)
                     {
                         // We check if we have a back'd up block image; we try to restore it back
-                        PGAlignedBlock buf;
+                        PGAlignedBlock aligned_buf;
                         Page page;
                         xl_heap_insert *xlrec;
                         ItemId lp;
 
-                        page = (Page)buf.data;
+                        page = (Page)aligned_buf.data;
                         if (bkp_blk->has_image)
                         {
                             if (!RestoreBlockImage(xlog_reader, 0, page))
@@ -259,7 +263,7 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
                     {
                         len = datalen - SizeOfHeapHeader;
                         hslot->tuple->t_len = len + SizeofHeapTupleHeader;
-                        hslot->tuple->t_data = palloc(hslot->tuple->t_len);
+                        hslot->tuple->t_data = (HeapTupleHeader)(tupledata + SizeOfHeapHeader);
                         header = hslot->tuple->t_data;
                         hslot->tuple->t_tableOid = classForm->oid;
 
@@ -268,11 +272,9 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
                         memset(header, 0, SizeofHeapTupleHeader);
 
                         memcpy(((char *)hslot->tuple->t_data) + SizeofHeapTupleHeader, tupledata + SizeOfHeapHeader, len);
-
                         header->t_infomask = xlhdr.t_infomask;
                         header->t_infomask2 = xlhdr.t_infomask2;
                         header->t_hoff = xlhdr.t_hoff;
-                        pfree(hslot->tuple->t_data);
                     }
 
                     slot->tts_ops->getsomeattrs(slot, tup_desc->natts);
@@ -285,73 +287,106 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
                     initStringInfo(&buf);
                     appendStringInfo(&buf, "INSERT INTO %s(", quote_qualified_identifier(nspname, RelationGetRelationName(relation)));
 
-                    is_null = false;
+                    prev_exists = false;
                     for (size_t attnum = 0; attnum < tup_desc->natts; attnum++)
                     {
                         Form_pg_attribute thisatt = TupleDescAttr(tup_desc, attnum);
+                        if (thisatt->atttypid == InvalidOid) // Exclude Deleted columns
+                            continue;
+
                         if (!slot->tts_isnull[attnum])
                         {
+                            if (prev_exists)
+                            {
+                                appendStringInfo(&buf, ",");
+                            }
+
                             appendStringInfo(&buf, "%s", NameStr(thisatt->attname));
 
-                            if ((attnum + 1) < tup_desc->natts && !slot->tts_isnull[attnum + 1])
-                            {
-                                appendStringInfo(&buf, ",");
-                            }
-                            is_null = true;
-                        }
-                        else
-                        {
-                            if ((attnum + 1) < tup_desc->natts && !slot->tts_isnull[attnum + 1] && is_null)
-                            {
-                                appendStringInfo(&buf, ",");
-                            }
+                            prev_exists = true;
                         }
                     }
                     appendStringInfo(&buf, ") VALUES(");
 
-                    is_null = false;
+                    prev_exists = false;
                     for (size_t attnum = 0; attnum < tup_desc->natts; attnum++)
                     {
                         Form_pg_attribute thisatt = TupleDescAttr(tup_desc, attnum);
+                        if (thisatt->atttypid == InvalidOid)
+                            continue;
+
                         if (!slot->tts_isnull[attnum])
                         {
+                            if (prev_exists)
+                            {
+                                appendStringInfo(&buf, ",");
+                            }
+
                             if (thisatt->attbyval)
                             {
-                                switch (thisatt->attlen)
+                                switch (thisatt->atttypid)
                                 {
-                                case sizeof(char):
+                                case BOOLOID:
                                     appendStringInfo(&buf, "%d", DatumGetChar(slot->tts_values[attnum]));
                                     break;
-                                case sizeof(int16):
+                                case CHAROID:
+                                    appendStringInfo(&buf, "%c", DatumGetChar(slot->tts_values[attnum]));
+                                    break;
+                                case INT2OID:
                                     appendStringInfo(&buf, "%i", DatumGetInt16(slot->tts_values[attnum]));
                                     break;
-                                case sizeof(int32):
+                                case INT4OID:
+                                case OIDOID:
+                                case XIDOID:
+                                case CIDOID:
                                     appendStringInfo(&buf, "%i", DatumGetInt32(slot->tts_values[attnum]));
                                     break;
-#if SIZEOF_DATUM == 8
-                                case sizeof(Datum):
-                                    appendStringInfo(&buf, "%s", DatumGetPointer(slot->tts_values[attnum]));
+                                case INT8OID:
+                                    appendStringInfo(&buf, "%ld", DatumGetInt64(slot->tts_values[attnum]));
                                     break;
-#endif
+                                case FLOAT4OID:
+                                    appendStringInfo(&buf, "%f", DatumGetFloat4(slot->tts_values[attnum]));
+                                    break;
+                                case FLOAT8OID:
+                                    appendStringInfo(&buf, "%f", DatumGetFloat8(slot->tts_values[attnum]));
+                                    break;
                                 default:
-                                    elog(ERROR, "unsupported attribute length: %d", thisatt->attlen);
+                                    elog(WARNING, "unsupported attribute length: %d", thisatt->attlen);
+                                    appendStringInfo(&buf, "%s", DatumGetPointer(slot->tts_values[attnum]));
                                 }
                             }
                             else
-                                appendStringInfo(&buf, "%s", DatumGetPointer(slot->tts_values[attnum]));
-
-                            if ((attnum + 1) < tup_desc->natts && !slot->tts_isnull[attnum + 1])
                             {
-                                appendStringInfo(&buf, ",");
+                                if (thisatt->atttypid == TEXTOID)
+                                {
+                                    char *data = DatumGetPointer(slot->tts_values[attnum]);
+                                    if ((header->t_infomask & HEAP_HASVARWIDTH) != 0)
+                                    {
+                                        if ((header->t_infomask & HEAP_HASEXTERNAL) != 0)
+                                        {
+                                            struct varlena *val = (struct varlena *)data;
+                                            appendStringInfo(&buf, "'%s'", (char *)(detoast_attr(val)->vl_dat));
+                                        }
+                                        else
+                                        {
+                                            if (VARATT_IS_SHORT(data))
+                                                appendStringInfo(&buf, "'%s'", (char *)VARDATA_SHORT(data));
+                                            else if (VARATT_IS_EXTENDED(data))
+                                            {
+                                                struct varlena *val = (struct varlena *)data;
+                                                appendStringInfo(&buf, "'%s'", (char *)(detoast_attr(val)->vl_dat));
+                                            }
+                                            else
+                                                appendStringInfo(&buf, "'%s'", (char *)VARDATA_ANY(data));
+                                        }
+                                    }
+                                    else
+                                    {
+                                        appendStringInfo(&buf, "%s", data);
+                                    }
+                                }
                             }
-                            is_null = true;
-                        }
-                        else
-                        {
-                            if ((attnum + 1) < tup_desc->natts && !slot->tts_isnull[attnum + 1] && is_null)
-                            {
-                                appendStringInfo(&buf, ",");
-                            }
+                            prev_exists = true;
                         }
                     }
                     appendStringInfo(&buf, ");");
