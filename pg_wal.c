@@ -324,8 +324,6 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
 
                         memcpy((char *)&xlhdr, tupledata, SizeOfHeapHeader);
 
-                        memset(header, 0, SizeofHeapTupleHeader);
-
                         memcpy(((char *)hslot->tuple->t_data) + SizeofHeapTupleHeader, tupledata + SizeOfHeapHeader, len);
                         header->t_infomask = xlhdr.t_infomask;
                         header->t_infomask2 = xlhdr.t_infomask2;
