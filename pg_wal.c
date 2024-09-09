@@ -847,25 +847,11 @@ static void xlog_decode_insert(Relation relation, HeapTupleHeader header, TupleD
                 if (thisatt->atttypid == TEXTOID)
                 {
                     char *data = DatumGetPointer(slot->tts_values[attnum]);
+                    struct varlena *val;
                     if ((header->t_infomask & HEAP_HASVARWIDTH) != 0)
                     {
-                        if ((header->t_infomask & HEAP_HASEXTERNAL) != 0)
-                        {
-                            struct varlena *val = (struct varlena *)data;
-                            appendStringInfo(buf, "'%s'", text_to_cstring(val));
-                        }
-                        else
-                        {
-                            if (VARATT_IS_SHORT(data))
-                                appendStringInfo(buf, "'%s'", (char *)VARDATA_SHORT(data));
-                            else if (VARATT_IS_EXTENDED(data))
-                            {
-                                struct varlena *val = (struct varlena *)data;
-                                appendStringInfo(buf, "'%s'", text_to_cstring(val));
-                            }
-                            else
-                                appendStringInfo(buf, "'%s'", (char *)VARDATA_ANY(data));
-                        }
+                        val = (struct varlena *)data;
+                        appendStringInfo(buf, "'%s'", text_to_cstring(val));
                     }
                     else
                     {
