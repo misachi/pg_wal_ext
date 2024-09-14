@@ -216,7 +216,7 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
                             BTEqualStrategyNumber, F_OIDEQ,
                             ObjectIdGetDatum(bkp_blk->rlocator.relNumber));
                 sscan = systable_beginscan(rel_rel, ClassTblspcRelfilenodeIndexId, true,
-                                           SnapshotSelf, 1, &skey);
+                                           NULL, 1, &skey);
 
                 tuple = systable_getnext(sscan);
                 if (!HeapTupleIsValid(tuple))
@@ -757,6 +757,7 @@ static void xlog_decode_delete(Relation relation, HeapTuple tup, TupleDesc tup_d
                 prev_exists = true;
             }
             pfree(attname);
+            bms_free(key_attrs);
         }
     }
 
