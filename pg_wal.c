@@ -366,6 +366,7 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
         }
     }
 end:
+    ; // For some reason Clang runs and throws an error if installed. This make it quiet
 }
 
 static XLogRecord *get_xlog_record(XLogReaderState *xlogreader, XLogRecPtr targetRecPtr)

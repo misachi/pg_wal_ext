@@ -9,7 +9,7 @@ DATA = pg_wal_ext--1.0.sql
 PGFILEDESC = "pg_wal_ext - Decode WAL files data"
 REGRESS = pg_wal_ext
 
-ifdef USE_PGXS
+ifndef OLD_INSTALL  # Random variable name???
 PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
