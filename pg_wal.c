@@ -310,6 +310,8 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
                             lp = PageGetItemId(page, ((xl_heap_insert *)xlrec)->offnum);
                         else if (info == XLOG_HEAP_DELETE)
                             lp = PageGetItemId(page, ((xl_heap_delete *)xlrec)->offnum);
+                        else
+                            goto cleanup;
 
                         header = (HeapTupleHeader)PageGetItem(page, lp);
                         hslot->tuple->t_data = header;
@@ -345,7 +347,6 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
                     }
                     else
                     {
-
                         xlog_decode_insert(relation, header, tup_desc, slot, &buf, nspname);
                         values[4] = CStringGetTextDatum(buf.data);
                         nulls[4] = false;
@@ -365,8 +366,7 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
             Assert(!XLogRecPtrIsInvalid(temp_lsn));
         }
     }
-end:
-    ; // For some reason Clang runs and throws an error if installed. This make it quiet
+end:; // For some reason Clang runs and throws an error if installed. This make it quiet
 }
 
 static XLogRecord *get_xlog_record(XLogReaderState *xlogreader, XLogRecPtr targetRecPtr)
@@ -566,7 +566,7 @@ Datum pg_xlog_records(PG_FUNCTION_ARGS)
 
 static void xlog_decode_delete(Relation relation, HeapTuple tup, TupleDesc tup_desc, TupleTableSlot *slot, StringInfoData *buf, char *nspname)
 {
-    int index;
+    int index, num_restarts;
     StringInfoData buf1;
     Bitmapset *key_attrs;
     HeapTupleHeader header = tup->t_data;
@@ -574,7 +574,10 @@ static void xlog_decode_delete(Relation relation, HeapTuple tup, TupleDesc tup_d
     initStringInfo(buf);
     initStringInfo(&buf1);
     appendStringInfo(buf, "DELETE FROM %s", quote_qualified_identifier(nspname, RelationGetRelationName(relation)));
-    if (!RelationGetForm(relation)->relhasindex)
+    num_restarts = 0;
+
+restart:
+    if (!RelationGetForm(relation)->relhasindex || num_restarts > 0)
     {
         bool prev_exists;
         prev_exists = false;
@@ -622,7 +625,7 @@ static void xlog_decode_delete(Relation relation, HeapTuple tup, TupleDesc tup_d
                         appendStringInfo(&buf1, "%f", DatumGetFloat8(slot->tts_values[attnum]));
                         break;
                     default:
-                        elog(WARNING, "unsupported attribute length: %d", thisatt->attlen);
+                        // elog(WARNING, "unsupported attribute length: %d", thisatt->attlen);
                         appendStringInfo(&buf1, "%s", DatumGetPointer(slot->tts_values[attnum]));
                     }
                 }
@@ -631,25 +634,11 @@ static void xlog_decode_delete(Relation relation, HeapTuple tup, TupleDesc tup_d
                     if (thisatt->atttypid == TEXTOID)
                     {
                         char *data = DatumGetPointer(slot->tts_values[attnum]);
+                        struct varlena *val;
                         if ((header->t_infomask & HEAP_HASVARWIDTH) != 0)
                         {
-                            if ((header->t_infomask & HEAP_HASEXTERNAL) != 0)
-                            {
-                                struct varlena *val = (struct varlena *)data;
-                                appendStringInfo(&buf1, "'%s'", text_to_cstring(val));
-                            }
-                            else
-                            {
-                                if (VARATT_IS_SHORT(data))
-                                    appendStringInfo(&buf1, "'%s'", (char *)VARDATA_SHORT(data));
-                                else if (VARATT_IS_EXTENDED(data))
-                                {
-                                    struct varlena *val = (struct varlena *)data;
-                                    appendStringInfo(&buf1, "'%s'", text_to_cstring(val));
-                                }
-                                else
-                                    appendStringInfo(&buf1, "'%s'", (char *)VARDATA_ANY(data));
-                            }
+                            val = (struct varlena *)data;
+                            appendStringInfo(&buf1, "'%s'", text_to_cstring(val));
                         }
                         else
                         {
@@ -674,11 +663,18 @@ static void xlog_decode_delete(Relation relation, HeapTuple tup, TupleDesc tup_d
             char *attname;
             Form_pg_attribute thisatt;
 
-            attname = get_attname(RelationGetRelid(relation), attnum, false);
+            attname = get_attname(RelationGetRelid(relation), attnum, true);
+            if (!attname)
+                continue;
+
             attnum = get_attnum(RelationGetRelid(relation), attname);
 
             if (attnum == InvalidAttrNumber)
+            {
+                pfree(attname);
+                bms_free(key_attrs);
                 elog(ERROR, "cache lookup failed for attribute %s of relation %u", attname, RelationGetRelid(relation));
+            }
 
             thisatt = TupleDescAttr(tup_desc, attnum - 1);
 
@@ -687,6 +683,7 @@ static void xlog_decode_delete(Relation relation, HeapTuple tup, TupleDesc tup_d
 
             if (!slot->tts_isnull[attnum - 1])
             {
+                Datum temp = slot->tts_values[attnum - 1];
                 if (prev_exists)
                     appendStringInfo(&buf1, " AND ");
 
@@ -696,76 +693,79 @@ static void xlog_decode_delete(Relation relation, HeapTuple tup, TupleDesc tup_d
                     switch (thisatt->atttypid)
                     {
                     case BOOLOID:
-                        appendStringInfo(&buf1, "%d", DatumGetChar(slot->tts_values[attnum - 1]));
+                        appendStringInfo(&buf1, "%d", DatumGetChar(temp));
                         break;
                     case CHAROID:
-                        appendStringInfo(&buf1, "%c", DatumGetChar(slot->tts_values[attnum - 1]));
+                        appendStringInfo(&buf1, "%c", DatumGetChar(temp));
                         break;
                     case INT2OID:
-                        appendStringInfo(&buf1, "%i", DatumGetInt16(slot->tts_values[attnum - 1]));
+                        appendStringInfo(&buf1, "%i", DatumGetInt16(temp));
                         break;
                     case INT4OID:
                     case OIDOID:
                     case XIDOID:
                     case CIDOID:
-                        appendStringInfo(&buf1, "%i", DatumGetInt32(slot->tts_values[attnum - 1]));
+                        appendStringInfo(&buf1, "%i", DatumGetInt32(temp));
                         break;
                     case INT8OID:
-                        appendStringInfo(&buf1, "%ld", DatumGetInt64(slot->tts_values[attnum - 1]));
+                        appendStringInfo(&buf1, "%ld", DatumGetInt64(temp));
                         break;
                     case FLOAT4OID:
-                        appendStringInfo(&buf1, "%f", DatumGetFloat4(slot->tts_values[attnum - 1]));
+                        appendStringInfo(&buf1, "%f", DatumGetFloat4(temp));
                         break;
                     case FLOAT8OID:
-                        appendStringInfo(&buf1, "%f", DatumGetFloat8(slot->tts_values[attnum - 1]));
+                        appendStringInfo(&buf1, "%f", DatumGetFloat8(temp));
                         break;
                     default:
-                        elog(WARNING, "unsupported attribute length: %d", thisatt->attlen);
-                        appendStringInfo(&buf1, "%s", DatumGetPointer(slot->tts_values[attnum - 1]));
+                        // elog(WARNING, "unsupported attribute length: %d", thisatt->attlen);
+                        appendStringInfo(&buf1, "%zu", DatumGetInt64(temp));
                     }
                 }
                 else
                 {
                     if (thisatt->atttypid == TEXTOID)
                     {
-                        char *data = DatumGetPointer(slot->tts_values[attnum - 1]);
+                        char *data = DatumGetPointer(temp);
+                        struct varlena *val;
                         if ((header->t_infomask & HEAP_HASVARWIDTH) != 0)
                         {
-                            if ((header->t_infomask & HEAP_HASEXTERNAL) != 0)
-                            {
-                                struct varlena *val = (struct varlena *)data;
-                                appendStringInfo(&buf1, "'%s'", text_to_cstring(val));
-                            }
-                            else
-                            {
-                                if (VARATT_IS_SHORT(data))
-                                    appendStringInfo(&buf1, "'%s'", (char *)VARDATA_SHORT(data));
-                                else if (VARATT_IS_EXTENDED(data))
-                                {
-                                    struct varlena *val = (struct varlena *)data;
-                                    appendStringInfo(&buf1, "'%s'", text_to_cstring(val));
-                                }
-                                else
-                                    appendStringInfo(&buf1, "'%s'", (char *)VARDATA_ANY(data));
-                            }
+                            val = (struct varlena *)data;
+                            appendStringInfo(&buf1, "'%s'", text_to_cstring(val));
                         }
                         else
                         {
                             appendStringInfo(&buf1, "%s", data);
                         }
                     }
+                    else
+                    {
+                        char *data = DatumGetCString(temp);
+                        appendStringInfo(&buf1, "%s", data);
+                    }
                 }
                 prev_exists = true;
             }
             pfree(attname);
-            bms_free(key_attrs);
         }
+        bms_free(key_attrs);
     }
 
     if (buf1.len)
         appendStringInfo(buf, " WHERE %s;", buf1.data);
     else
+    {
+        /*
+            This is a hack check to ensure we don't accidentally get DELETE queries that
+            can wipe out the whole table e.g DELETE FROM pg_depend. If the first pass fails(with indexes),
+            we try a second time without the indexes
+        */
+        if (RelationGetForm(relation)->relhasindex && num_restarts < 2)
+        {
+            num_restarts++;
+            goto restart;
+        }
         appendStringInfo(buf, ";");
+    }
 }
 
 static void xlog_decode_insert(Relation relation, HeapTupleHeader header, TupleDesc tup_desc, TupleTableSlot *slot, StringInfoData *buf, char *nspname)
@@ -816,7 +816,7 @@ static void xlog_decode_insert(Relation relation, HeapTupleHeader header, TupleD
                 switch (thisatt->atttypid)
                 {
                 case BOOLOID:
-                    appendStringInfo(buf, "%d", DatumGetChar(slot->tts_values[attnum]));
+                    appendStringInfo(buf, "%c", DatumGetBool(slot->tts_values[attnum]) == 1 ? 't' : 'f');
                     break;
                 case CHAROID:
                     appendStringInfo(buf, "%c", DatumGetChar(slot->tts_values[attnum]));
@@ -840,8 +840,8 @@ static void xlog_decode_insert(Relation relation, HeapTupleHeader header, TupleD
                     appendStringInfo(buf, "%f", DatumGetFloat8(slot->tts_values[attnum]));
                     break;
                 default:
-                    elog(WARNING, "unsupported attribute length: %d", thisatt->attlen);
-                    appendStringInfo(buf, "%s", DatumGetPointer(slot->tts_values[attnum]));
+                    // elog(WARNING, "unsupported attribute length: %d", thisatt->attlen);
+                    appendStringInfo(buf, "%zu", DatumGetInt64(slot->tts_values[attnum]));
                 }
             }
             else
@@ -859,6 +859,11 @@ static void xlog_decode_insert(Relation relation, HeapTupleHeader header, TupleD
                     {
                         appendStringInfo(buf, "%s", data);
                     }
+                }
+                else
+                {
+                    char *data = DatumGetCString(slot->tts_values[attnum]);
+                    appendStringInfo(buf, "%s", data);
                 }
             }
             prev_exists = true;
