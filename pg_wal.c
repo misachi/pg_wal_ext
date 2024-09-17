@@ -1,4 +1,5 @@
 #include <unistd.h>
+#include <fcntl.h>
 
 #include "postgres.h"
 #include "access/commit_ts.h"
@@ -31,6 +32,9 @@
 #include "utils/lsyscache.h"
 
 PG_MODULE_MAGIC;
+
+static int file_fd;
+static HTAB *page_cache_hash;
 
 #define CHECK_NEXT_ATTR(tup_desc, attnum, is_null) ( \
     (attnum + 1) < (tup_desc->natts) && (!is_null[attnum + 1]))
@@ -114,21 +118,21 @@ static int read_xlog_page(XLogReaderState *xlogreader, XLogRecPtr targetPagePtr,
     int read_len;
     XLogPageHeader hdr;
 
-    int fd = open(private->path_name, O_RDONLY | PG_BINARY, 0);
-
-    if (lseek(fd, (off_t)target_page_off, SEEK_SET) < 0)
+    if (lseek(file_fd, (off_t)target_page_off, SEEK_SET) < 0)
     {
-        elog(ERROR, "unable to seek file \"%s\" desc %i", private->path_name, fd);
+        elog(WARNING, "unable to seek file \"%s\" desc %i", private->path_name, file_fd);
+        return -1;
     }
 
-    read_len = read(fd, readBuf, reqLen);
+    read_len = read(file_fd, readBuf, reqLen);
     hdr = (XLogPageHeader)readBuf;
 
     if (!XLogReaderValidatePageHeader(xlogreader, targetRecPtr, (char *)hdr))
     {
-        elog(ERROR, "Invalid page header errorMsg: %s, page off: %u, recPtr: %zu, pagePtr: %zu, pageAdrr: %zu, info: %u, rem length: %u",
+        elog(WARNING, "Invalid page header errorMsg: %s, page off: %u, recPtr: %zu, pagePtr: %zu, pageAdrr: %zu, info: %u, rem length: %u",
              xlogreader->errormsg_buf, target_page_off, targetRecPtr,
              targetPagePtr, hdr->xlp_pageaddr, hdr->xlp_info, hdr->xlp_rem_len);
+        return -1;
     }
 
     Assert(read_len == XLOG_BLCKSZ);
@@ -137,7 +141,6 @@ static int read_xlog_page(XLogReaderState *xlogreader, XLogRecPtr targetPagePtr,
     xlogreader->segoff = target_page_off;
     xlogreader->readLen = read_len;
 
-    close(fd);
     return read_len;
 }
 
@@ -149,35 +152,50 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
     XLogRecPtr temp_lsn;
     XLogRecPtr page_ptr;
     XLogRecord *record;
-    int num_pages;
+    int num_pages, bytes_read;
     char *temp_type = NULL;
     TransactionId xid;
     uint8 info, info2;
     xl_xact_commit *xlrec;
+    Relation rel_rel;
+    HASHCTL	page_ctl;
+
+    page_ctl.keysize = sizeof(RelFileLocator);
+    page_ctl.entrysize = sizeof(CachedPage);
+
+    page_cache_hash = hash_create("page cache", 1024, &page_ctl, HASH_ELEM | HASH_STRINGS);
 
     /* Act as temporary cache for restored pages. We can use these for
         decoding DML operations since we'll already have the record offsets
     */
-    CachedPage cached_pages[1024];
-    size_t cached_page_off = 0;
+    // CachedPage cached_pages[1024];
+    // size_t cached_page_off = 0;
 
     InitMaterializedSRF(fcinfo, 0);
 
     XLogSegNoOffsetToRecPtr(seg_no, 0, wal_segment_size, start_lsn);
     temp_lsn = start_lsn;
 
+    rel_rel = table_open(RelationRelationId, AccessShareLock);
+
     num_pages = wal_segment_size / XLOG_BLCKSZ;
     for (size_t i = 0; i < num_pages; i++)
     {
         page_ptr = temp_lsn - (temp_lsn % XLOG_BLCKSZ);
         end_lsn = page_ptr + XLOG_BLCKSZ;
-        xlog_reader->routine.page_read(xlog_reader, page_ptr, XLOG_BLCKSZ, page_ptr, xlog_reader->readBuf);
+        bytes_read = xlog_reader->routine.page_read(xlog_reader, page_ptr, XLOG_BLCKSZ, page_ptr, xlog_reader->readBuf);
+        if (bytes_read < 0) {
+            table_close(rel_rel, AccessShareLock);
+            goto end;
+        }
+
         while (temp_lsn < end_lsn)
         {
             record = get_xlog_record(xlog_reader, temp_lsn);
             if (!record)
             {
                 elog(INFO, "Current_LSN: %zu END_LSN: %zu", temp_lsn, end_lsn);
+                table_close(rel_rel, AccessShareLock);
                 goto end;
             }
 
@@ -191,7 +209,7 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
                  (record->xl_rmid == RM_XACT_ID && (info2 == XLOG_XACT_COMMIT || info2 == XLOG_XACT_COMMIT_PREPARED))))
             {
                 TupleDesc tup_desc;
-                Relation relation, rel_rel;
+                Relation relation;
                 DecodedBkpBlock *bkp_blk;
                 HeapTupleData tup;
                 HeapTupleHeader header;
@@ -207,10 +225,11 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
                 SysScanDesc sscan;
                 Form_pg_class classForm = NULL;
                 HeapTuple tuple = NULL;
+                CachedPage *hentry;
 
                 bkp_blk = &xlog_reader->record->blocks[0];
 
-                rel_rel = table_open(RelationRelationId, AccessShareLock);
+                // rel_rel = table_open(RelationRelationId, AccessShareLock);
                 ScanKeyInit(&skey,
                             Anum_pg_class_relfilenode,
                             BTEqualStrategyNumber, F_OIDEQ,
@@ -222,7 +241,6 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
                 if (!HeapTupleIsValid(tuple))
                 {
                     systable_endscan(sscan);
-                    table_close(rel_rel, AccessShareLock);
                     goto cleanup;
                 }
 
@@ -232,7 +250,6 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
                     classForm->relkind == RELKIND_COMPOSITE_TYPE)
                 {
                     systable_endscan(sscan);
-                    table_close(rel_rel, AccessShareLock);
                     goto cleanup;
                 }
 
@@ -271,36 +288,43 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
                         page = (Page)aligned_buf.data;
                         if (bkp_blk->has_image)
                         {
-                            CachedPage cached_page;
+                            // CachedPage cached_page;
                             if (!RestoreBlockImage(xlog_reader, 0, page))
                                 ereport(ERROR,
                                         (errcode(ERRCODE_INTERNAL_ERROR),
                                          errmsg_internal("Error restoring block image: %s", xlog_reader->errormsg_buf)));
-                            cached_page.blk_no = bkp_blk->blkno;
-                            cached_page.rlocator = bkp_blk->rlocator;
-                            cached_page.entry = page;
-                            cached_pages[cached_page_off] = cached_page;
-                            cached_page_off += 1;
+                            // cached_page.blk_no = bkp_blk->blkno;
+                            // cached_page.rlocator = bkp_blk->rlocator;
+                            // cached_page.entry = page;
+                            // cached_pages[cached_page_off] = cached_page;
+                            // cached_page_off += 1;
+
+                            hentry = (CachedPage *)hash_search(page_cache_hash, &bkp_blk->rlocator, HASH_ENTER, NULL);
+                            hentry->rlocator = bkp_blk->rlocator;
+                            hentry->entry = page;
+                            hentry->blk_no = bkp_blk->blkno;
                         }
                         else
                         {
-                            if (cached_page_off > 0)
+                            hentry = (CachedPage *)hash_search(page_cache_hash, &bkp_blk->rlocator, HASH_FIND, NULL);
+                            if(hentry)
+                            // if (cached_page_off > 0)
                             {
-                                for (size_t k = 0; k < cached_page_off; k++)
-                                {
-                                    if (cached_pages[k].blk_no == bkp_blk->blkno && cached_pages[k].rlocator.spcOid == bkp_blk->rlocator.spcOid && cached_pages[k].rlocator.dbOid == bkp_blk->rlocator.dbOid && cached_pages[k].rlocator.relNumber == bkp_blk->rlocator.relNumber)
-                                    {
-                                        page = cached_pages[k].entry;
-                                        break;
-                                    }
-                                }
+                                // for (size_t k = 0; k < cached_page_off; k++)
+                                // {
+                                //     if (cached_pages[k].blk_no == bkp_blk->blkno && cached_pages[k].rlocator.spcOid == bkp_blk->rlocator.spcOid && cached_pages[k].rlocator.dbOid == bkp_blk->rlocator.dbOid && cached_pages[k].rlocator.relNumber == bkp_blk->rlocator.relNumber)
+                                //     {
+                                //         page = cached_pages[k].entry;
+                                //         break;
+                                //     }
+                                // }
+                                page = hentry->entry;
                             }
                             else
                             {
                                 DecrTupleDescRefCount(tup_desc);
                                 table_close(relation, AccessShareLock);
                                 systable_endscan(sscan);
-                                table_close(rel_rel, AccessShareLock);
                                 goto cleanup;
                             }
                         }
@@ -357,7 +381,6 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
                 }
                 tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
                 systable_endscan(sscan);
-                table_close(rel_rel, AccessShareLock);
             }
 
         cleanup:
@@ -366,7 +389,8 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
             Assert(!XLogRecPtrIsInvalid(temp_lsn));
         }
     }
-end:; // For some reason Clang runs and throws an error if installed. This make it quiet
+    table_close(rel_rel, AccessShareLock);
+end:;
 }
 
 static XLogRecord *get_xlog_record(XLogReaderState *xlogreader, XLogRecPtr targetRecPtr)
@@ -546,6 +570,9 @@ Datum pg_xlog_records(PG_FUNCTION_ARGS)
 
     private.seg_no = seg_no;
     snprintf(private.path_name, MAXPGPATH, "%s", path);
+
+    file_fd = open(private.path_name, O_RDONLY | PG_BINARY, 0);
+    posix_fadvise64(file_fd, 0, 0, POSIX_FADV_SEQUENTIAL);
 
     xlog_reader = XLogReaderAllocate(wal_segment_size, directory,
                                      XL_ROUTINE(.page_read = &read_xlog_page,
