@@ -34,7 +34,7 @@
 PG_MODULE_MAGIC;
 
 static int file_fd;
-static HTAB *page_cache_hash;
+static HTAB *page_cache_hash, *table_cache_hash;
 
 #define CHECK_NEXT_ATTR(tup_desc, attnum, is_null) ( \
     (attnum + 1) < (tup_desc->natts) && (!is_null[attnum + 1]))
@@ -64,6 +64,12 @@ typedef struct CachedPage
     BlockNumber blk_no;
     Page entry;
 } CachedPage;
+
+typedef struct TableCache
+{
+    RelFileLocator rlocator;
+    Form_pg_class tuple;
+} TableCache;
 
 static void split_path(const char *path, char **dir, char **fname)
 {
@@ -158,12 +164,16 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
     uint8 info, info2;
     xl_xact_commit *xlrec;
     Relation rel_rel;
-    HASHCTL	page_ctl;
+    HASHCTL page_ctl, table_ctl;
 
     page_ctl.keysize = sizeof(RelFileLocator);
     page_ctl.entrysize = sizeof(CachedPage);
 
+    table_ctl.keysize = sizeof(RelFileLocator);
+    table_ctl.entrysize = sizeof(TableCache);
+
     page_cache_hash = hash_create("page cache", 1024, &page_ctl, HASH_ELEM | HASH_STRINGS);
+    table_cache_hash = hash_create("table cache", 1024, &table_ctl, HASH_ELEM | HASH_STRINGS);
 
     /* Act as temporary cache for restored pages. We can use these for
         decoding DML operations since we'll already have the record offsets
@@ -184,7 +194,8 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
         page_ptr = temp_lsn - (temp_lsn % XLOG_BLCKSZ);
         end_lsn = page_ptr + XLOG_BLCKSZ;
         bytes_read = xlog_reader->routine.page_read(xlog_reader, page_ptr, XLOG_BLCKSZ, page_ptr, xlog_reader->readBuf);
-        if (bytes_read < 0) {
+        if (bytes_read < 0)
+        {
             table_close(rel_rel, AccessShareLock);
             goto end;
         }
@@ -222,35 +233,45 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
                 TupleTableSlot *slot;
                 char *nspname;
                 ScanKeyData skey;
-                SysScanDesc sscan;
+                SysScanDesc sscan = NULL;
                 Form_pg_class classForm = NULL;
                 HeapTuple tuple = NULL;
-                CachedPage *hentry;
+                CachedPage *page_hentry;
+                TableCache *table_hentry;
 
                 bkp_blk = &xlog_reader->record->blocks[0];
 
-                // rel_rel = table_open(RelationRelationId, AccessShareLock);
-                ScanKeyInit(&skey,
-                            Anum_pg_class_relfilenode,
-                            BTEqualStrategyNumber, F_OIDEQ,
-                            ObjectIdGetDatum(bkp_blk->rlocator.relNumber));
-                sscan = systable_beginscan(rel_rel, ClassTblspcRelfilenodeIndexId, true,
-                                           NULL, 1, &skey);
-
-                tuple = systable_getnext(sscan);
-                if (!HeapTupleIsValid(tuple))
+                table_hentry = (TableCache *)hash_search(table_cache_hash, &bkp_blk->rlocator, HASH_FIND, NULL);
+                if (!table_hentry)
                 {
-                    systable_endscan(sscan);
-                    goto cleanup;
-                }
+                    ScanKeyInit(&skey,
+                                Anum_pg_class_relfilenode,
+                                BTEqualStrategyNumber, F_OIDEQ,
+                                ObjectIdGetDatum(bkp_blk->rlocator.relNumber));
+                    sscan = systable_beginscan(rel_rel, ClassTblspcRelfilenodeIndexId, true,
+                                               NULL, 1, &skey);
 
-                classForm = (Form_pg_class)GETSTRUCT(tuple);
-                if (classForm->relkind == RELKIND_INDEX ||
-                    classForm->relkind == RELKIND_PARTITIONED_INDEX ||
-                    classForm->relkind == RELKIND_COMPOSITE_TYPE)
-                {
-                    systable_endscan(sscan);
-                    goto cleanup;
+                    tuple = systable_getnext(sscan);
+                    if (!HeapTupleIsValid(tuple))
+                    {
+                        systable_endscan(sscan);
+                        goto cleanup;
+                    }
+
+                    classForm = (Form_pg_class)GETSTRUCT(tuple);
+                    if (classForm->relkind == RELKIND_INDEX ||
+                        classForm->relkind == RELKIND_PARTITIONED_INDEX ||
+                        classForm->relkind == RELKIND_COMPOSITE_TYPE)
+                    {
+                        systable_endscan(sscan);
+                        goto cleanup;
+                    }
+
+                    table_hentry = (TableCache *)hash_search(table_cache_hash, &bkp_blk->rlocator, HASH_ENTER, NULL);
+                    table_hentry->rlocator = bkp_blk->rlocator;
+                    table_hentry->tuple = classForm;
+                } else {
+                    classForm = table_hentry->tuple;
                 }
 
                 relation = table_open(classForm->oid, AccessShareLock);
@@ -288,43 +309,29 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
                         page = (Page)aligned_buf.data;
                         if (bkp_blk->has_image)
                         {
-                            // CachedPage cached_page;
                             if (!RestoreBlockImage(xlog_reader, 0, page))
                                 ereport(ERROR,
                                         (errcode(ERRCODE_INTERNAL_ERROR),
                                          errmsg_internal("Error restoring block image: %s", xlog_reader->errormsg_buf)));
-                            // cached_page.blk_no = bkp_blk->blkno;
-                            // cached_page.rlocator = bkp_blk->rlocator;
-                            // cached_page.entry = page;
-                            // cached_pages[cached_page_off] = cached_page;
-                            // cached_page_off += 1;
 
-                            hentry = (CachedPage *)hash_search(page_cache_hash, &bkp_blk->rlocator, HASH_ENTER, NULL);
-                            hentry->rlocator = bkp_blk->rlocator;
-                            hentry->entry = page;
-                            hentry->blk_no = bkp_blk->blkno;
+                            page_hentry = (CachedPage *)hash_search(page_cache_hash, &bkp_blk->rlocator, HASH_ENTER, NULL);
+                            page_hentry->rlocator = bkp_blk->rlocator;
+                            page_hentry->entry = page;
+                            page_hentry->blk_no = bkp_blk->blkno;
                         }
                         else
                         {
-                            hentry = (CachedPage *)hash_search(page_cache_hash, &bkp_blk->rlocator, HASH_FIND, NULL);
-                            if(hentry)
-                            // if (cached_page_off > 0)
+                            page_hentry = (CachedPage *)hash_search(page_cache_hash, &bkp_blk->rlocator, HASH_FIND, NULL);
+                            if (page_hentry)
                             {
-                                // for (size_t k = 0; k < cached_page_off; k++)
-                                // {
-                                //     if (cached_pages[k].blk_no == bkp_blk->blkno && cached_pages[k].rlocator.spcOid == bkp_blk->rlocator.spcOid && cached_pages[k].rlocator.dbOid == bkp_blk->rlocator.dbOid && cached_pages[k].rlocator.relNumber == bkp_blk->rlocator.relNumber)
-                                //     {
-                                //         page = cached_pages[k].entry;
-                                //         break;
-                                //     }
-                                // }
-                                page = hentry->entry;
+                                page = page_hentry->entry;
                             }
                             else
                             {
                                 DecrTupleDescRefCount(tup_desc);
                                 table_close(relation, AccessShareLock);
-                                systable_endscan(sscan);
+                                if(sscan)
+                                    systable_endscan(sscan);
                                 goto cleanup;
                             }
                         }
@@ -380,7 +387,8 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
                     table_close(relation, AccessShareLock);
                 }
                 tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
-                systable_endscan(sscan);
+                if(sscan)
+                    systable_endscan(sscan);
             }
 
         cleanup:
