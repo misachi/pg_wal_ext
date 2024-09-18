@@ -45,6 +45,7 @@ static char *record_type(XLogRecord *record);
 static XLogRecord *get_xlog_record(XLogReaderState *xlogreader, XLogRecPtr targetRecPtr);
 static void xlog_decode_insert(Relation relation, HeapTupleHeader header, TupleDesc tup_desc, TupleTableSlot *slot, StringInfoData *buf, char *nspname);
 static void xlog_decode_delete(Relation relation, HeapTuple tup, TupleDesc tup_desc, TupleTableSlot *slot, StringInfoData *buf, char *nspname);
+static void build_string(HeapTupleHeader header, Form_pg_attribute thisatt, StringInfoData *buf, Datum field_val);
 extern DecodedXLogRecord *XLogReadRecordAlloc(XLogReaderState *state, size_t xl_tot_len, bool allow_oversized);
 extern void report_invalid_record(XLogReaderState *state, const char *fmt, ...);
 extern bool ValidXLogRecordHeader(XLogReaderState *state, XLogRecPtr RecPtr, XLogRecPtr PrevRecPtr, XLogRecord *record, bool randAccess);
@@ -175,12 +176,6 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
     page_cache_hash = hash_create("page cache", 1024, &page_ctl, HASH_ELEM | HASH_STRINGS);
     table_cache_hash = hash_create("table cache", 1024, &table_ctl, HASH_ELEM | HASH_STRINGS);
 
-    /* Act as temporary cache for restored pages. We can use these for
-        decoding DML operations since we'll already have the record offsets
-    */
-    // CachedPage cached_pages[1024];
-    // size_t cached_page_off = 0;
-
     InitMaterializedSRF(fcinfo, 0);
 
     XLogSegNoOffsetToRecPtr(seg_no, 0, wal_segment_size, start_lsn);
@@ -270,7 +265,9 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
                     table_hentry = (TableCache *)hash_search(table_cache_hash, &bkp_blk->rlocator, HASH_ENTER, NULL);
                     table_hentry->rlocator = bkp_blk->rlocator;
                     table_hentry->tuple = classForm;
-                } else {
+                }
+                else
+                {
                     classForm = table_hentry->tuple;
                 }
 
@@ -330,7 +327,7 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
                             {
                                 DecrTupleDescRefCount(tup_desc);
                                 table_close(relation, AccessShareLock);
-                                if(sscan)
+                                if (sscan)
                                     systable_endscan(sscan);
                                 goto cleanup;
                             }
@@ -387,7 +384,7 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
                     table_close(relation, AccessShareLock);
                 }
                 tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
-                if(sscan)
+                if (sscan)
                     systable_endscan(sscan);
             }
 
@@ -599,6 +596,59 @@ Datum pg_xlog_records(PG_FUNCTION_ARGS)
     PG_RETURN_VOID();
 }
 
+static void build_string(HeapTupleHeader header, Form_pg_attribute thisatt, StringInfoData *buf, Datum field_val)
+{
+    if (thisatt->attbyval)
+    {
+        switch (thisatt->atttypid)
+        {
+        case BOOLOID:
+            appendStringInfo(buf, "%c", DatumGetBool(field_val) == 1 ? 't' : 'f');
+            break;
+        case CHAROID:
+            appendStringInfo(buf, "%c", DatumGetChar(field_val));
+            break;
+        case INT2OID:
+            appendStringInfo(buf, "%i", DatumGetInt16(field_val));
+            break;
+        case INT4OID:
+        case OIDOID:
+        case XIDOID:
+        case CIDOID:
+            appendStringInfo(buf, "%i", DatumGetInt32(field_val));
+            break;
+        case INT8OID:
+            appendStringInfo(buf, "%ld", DatumGetInt64(field_val));
+            break;
+        case FLOAT4OID:
+            appendStringInfo(buf, "%f", DatumGetFloat4(field_val));
+            break;
+        case FLOAT8OID:
+            appendStringInfo(buf, "%f", DatumGetFloat8(field_val));
+            break;
+        default:
+            appendStringInfo(buf, "%s", DatumGetPointer(field_val));
+        }
+    }
+    else
+    {
+        if (thisatt->atttypid == TEXTOID)
+        {
+            char *data = DatumGetPointer(field_val);
+            struct varlena *val;
+            if ((header->t_infomask & HEAP_HASVARWIDTH) != 0)
+            {
+                val = (struct varlena *)data;
+                appendStringInfo(buf, "'%s'", text_to_cstring(val));
+            }
+            else
+            {
+                appendStringInfo(buf, "%s", data);
+            }
+        }
+    }
+}
+
 static void xlog_decode_delete(Relation relation, HeapTuple tup, TupleDesc tup_desc, TupleTableSlot *slot, StringInfoData *buf, char *nspname)
 {
     int index, num_restarts;
@@ -630,57 +680,7 @@ restart:
                 }
 
                 appendStringInfo(&buf1, "%s=", NameStr(thisatt->attname));
-
-                if (thisatt->attbyval)
-                {
-                    switch (thisatt->atttypid)
-                    {
-                    case BOOLOID:
-                        appendStringInfo(&buf1, "%d", DatumGetChar(slot->tts_values[attnum]));
-                        break;
-                    case CHAROID:
-                        appendStringInfo(&buf1, "%c", DatumGetChar(slot->tts_values[attnum]));
-                        break;
-                    case INT2OID:
-                        appendStringInfo(&buf1, "%i", DatumGetInt16(slot->tts_values[attnum]));
-                        break;
-                    case INT4OID:
-                    case OIDOID:
-                    case XIDOID:
-                    case CIDOID:
-                        appendStringInfo(&buf1, "%i", DatumGetInt32(slot->tts_values[attnum]));
-                        break;
-                    case INT8OID:
-                        appendStringInfo(&buf1, "%ld", DatumGetInt64(slot->tts_values[attnum]));
-                        break;
-                    case FLOAT4OID:
-                        appendStringInfo(&buf1, "%f", DatumGetFloat4(slot->tts_values[attnum]));
-                        break;
-                    case FLOAT8OID:
-                        appendStringInfo(&buf1, "%f", DatumGetFloat8(slot->tts_values[attnum]));
-                        break;
-                    default:
-                        // elog(WARNING, "unsupported attribute length: %d", thisatt->attlen);
-                        appendStringInfo(&buf1, "%s", DatumGetPointer(slot->tts_values[attnum]));
-                    }
-                }
-                else
-                {
-                    if (thisatt->atttypid == TEXTOID)
-                    {
-                        char *data = DatumGetPointer(slot->tts_values[attnum]);
-                        struct varlena *val;
-                        if ((header->t_infomask & HEAP_HASVARWIDTH) != 0)
-                        {
-                            val = (struct varlena *)data;
-                            appendStringInfo(&buf1, "'%s'", text_to_cstring(val));
-                        }
-                        else
-                        {
-                            appendStringInfo(&buf1, "%s", data);
-                        }
-                    }
-                }
+                build_string(header, thisatt, &buf1, slot->tts_values[attnum]);
                 prev_exists = true;
             }
         }
@@ -723,61 +723,7 @@ restart:
                     appendStringInfo(&buf1, " AND ");
 
                 appendStringInfo(&buf1, "%s=", attname);
-                if (thisatt->attbyval)
-                {
-                    switch (thisatt->atttypid)
-                    {
-                    case BOOLOID:
-                        appendStringInfo(&buf1, "%d", DatumGetChar(temp));
-                        break;
-                    case CHAROID:
-                        appendStringInfo(&buf1, "%c", DatumGetChar(temp));
-                        break;
-                    case INT2OID:
-                        appendStringInfo(&buf1, "%i", DatumGetInt16(temp));
-                        break;
-                    case INT4OID:
-                    case OIDOID:
-                    case XIDOID:
-                    case CIDOID:
-                        appendStringInfo(&buf1, "%i", DatumGetInt32(temp));
-                        break;
-                    case INT8OID:
-                        appendStringInfo(&buf1, "%ld", DatumGetInt64(temp));
-                        break;
-                    case FLOAT4OID:
-                        appendStringInfo(&buf1, "%f", DatumGetFloat4(temp));
-                        break;
-                    case FLOAT8OID:
-                        appendStringInfo(&buf1, "%f", DatumGetFloat8(temp));
-                        break;
-                    default:
-                        // elog(WARNING, "unsupported attribute length: %d", thisatt->attlen);
-                        appendStringInfo(&buf1, "%zu", DatumGetInt64(temp));
-                    }
-                }
-                else
-                {
-                    if (thisatt->atttypid == TEXTOID)
-                    {
-                        char *data = DatumGetPointer(temp);
-                        struct varlena *val;
-                        if ((header->t_infomask & HEAP_HASVARWIDTH) != 0)
-                        {
-                            val = (struct varlena *)data;
-                            appendStringInfo(&buf1, "'%s'", text_to_cstring(val));
-                        }
-                        else
-                        {
-                            appendStringInfo(&buf1, "%s", data);
-                        }
-                    }
-                    else
-                    {
-                        char *data = DatumGetCString(temp);
-                        appendStringInfo(&buf1, "%s", data);
-                    }
-                }
+                build_string(header, thisatt, &buf1, temp);
                 prev_exists = true;
             }
             pfree(attname);
@@ -790,10 +736,10 @@ restart:
     else
     {
         /*
-            This is a hack check to ensure we don't accidentally get DELETE queries that
-            can wipe out the whole table e.g DELETE FROM pg_depend. If the first pass fails(with indexes),
-            we try a second time without the indexes
-        */
+         *   This is a hack check to ensure we don't accidentally get DELETE queries that
+         *   can wipe out the whole table e.g DELETE FROM pg_depend. If the first pass fails(with indexes),
+         *   we try a second time without the indexes
+         */
         if (RelationGetForm(relation)->relhasindex && num_restarts < 2)
         {
             num_restarts++;
@@ -846,61 +792,7 @@ static void xlog_decode_insert(Relation relation, HeapTupleHeader header, TupleD
                 appendStringInfo(buf, ",");
             }
 
-            if (thisatt->attbyval)
-            {
-                switch (thisatt->atttypid)
-                {
-                case BOOLOID:
-                    appendStringInfo(buf, "%c", DatumGetBool(slot->tts_values[attnum]) == 1 ? 't' : 'f');
-                    break;
-                case CHAROID:
-                    appendStringInfo(buf, "%c", DatumGetChar(slot->tts_values[attnum]));
-                    break;
-                case INT2OID:
-                    appendStringInfo(buf, "%i", DatumGetInt16(slot->tts_values[attnum]));
-                    break;
-                case INT4OID:
-                case OIDOID:
-                case XIDOID:
-                case CIDOID:
-                    appendStringInfo(buf, "%i", DatumGetInt32(slot->tts_values[attnum]));
-                    break;
-                case INT8OID:
-                    appendStringInfo(buf, "%ld", DatumGetInt64(slot->tts_values[attnum]));
-                    break;
-                case FLOAT4OID:
-                    appendStringInfo(buf, "%f", DatumGetFloat4(slot->tts_values[attnum]));
-                    break;
-                case FLOAT8OID:
-                    appendStringInfo(buf, "%f", DatumGetFloat8(slot->tts_values[attnum]));
-                    break;
-                default:
-                    // elog(WARNING, "unsupported attribute length: %d", thisatt->attlen);
-                    appendStringInfo(buf, "%zu", DatumGetInt64(slot->tts_values[attnum]));
-                }
-            }
-            else
-            {
-                if (thisatt->atttypid == TEXTOID)
-                {
-                    char *data = DatumGetPointer(slot->tts_values[attnum]);
-                    struct varlena *val;
-                    if ((header->t_infomask & HEAP_HASVARWIDTH) != 0)
-                    {
-                        val = (struct varlena *)data;
-                        appendStringInfo(buf, "'%s'", text_to_cstring(val));
-                    }
-                    else
-                    {
-                        appendStringInfo(buf, "%s", data);
-                    }
-                }
-                else
-                {
-                    char *data = DatumGetCString(slot->tts_values[attnum]);
-                    appendStringInfo(buf, "%s", data);
-                }
-            }
+            build_string(header, thisatt, buf, slot->tts_values[attnum]);
             prev_exists = true;
         }
     }
