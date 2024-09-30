@@ -45,6 +45,7 @@ static char *record_type(XLogRecord *record);
 static XLogRecord *get_xlog_record(XLogReaderState *xlogreader, XLogRecPtr targetRecPtr);
 static void xlog_decode_insert(Relation relation, HeapTupleHeader header, TupleDesc tup_desc, TupleTableSlot *slot, StringInfoData *buf, char *nspname);
 static void xlog_decode_delete(Relation relation, HeapTuple tup, TupleDesc tup_desc, TupleTableSlot *slot, StringInfoData *buf, char *nspname);
+static void xlog_decode_update(Relation relation, HeapTuple tup, TupleDesc tup_desc, TupleTableSlot *slot, StringInfoData *buf, char *nspname);
 static void build_string(HeapTupleHeader header, Form_pg_attribute thisatt, StringInfoData *buf, Datum field_val);
 extern DecodedXLogRecord *XLogReadRecordAlloc(XLogReaderState *state, size_t xl_tot_len, bool allow_oversized);
 extern void report_invalid_record(XLogReaderState *state, const char *fmt, ...);
@@ -211,7 +212,7 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
             info = record->xl_info & ~XLR_INFO_MASK;
             info2 = record->xl_info & XLOG_XACT_OPMASK;
 
-            if (((xlog_reader->record && record->xl_rmid == RM_HEAP_ID && (info == XLOG_HEAP_DELETE || info == XLOG_HEAP_INSERT)) ||
+            if (((xlog_reader->record && record->xl_rmid == RM_HEAP_ID && (info == XLOG_HEAP_DELETE || info == XLOG_HEAP_INSERT || info == XLOG_HEAP_UPDATE)) ||
                  (record->xl_rmid == RM_XACT_ID && (info2 == XLOG_XACT_COMMIT || info2 == XLOG_XACT_COMMIT_PREPARED))))
             {
                 TupleDesc tup_desc;
@@ -338,6 +339,8 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
                             lp = PageGetItemId(page, ((xl_heap_insert *)xlrec)->offnum);
                         else if (info == XLOG_HEAP_DELETE)
                             lp = PageGetItemId(page, ((xl_heap_delete *)xlrec)->offnum);
+                        else if (info == XLOG_HEAP_UPDATE)
+                            lp = PageGetItemId(page, ((xl_heap_update *)xlrec)->new_offnum);
                         else
                             goto cleanup;
 
@@ -367,18 +370,21 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
                     else
                         nspname = get_namespace_name(relation->rd_rel->relnamespace);
 
-                    if (info == XLOG_HEAP_DELETE)
+                    if (info == XLOG_HEAP_UPDATE)
+                    {
+                        xlog_decode_update(relation, hslot->tuple, tup_desc, slot, &buf, nspname);
+                    }
+                    else if (info == XLOG_HEAP_DELETE)
                     {
                         xlog_decode_delete(relation, hslot->tuple, tup_desc, slot, &buf, nspname);
-                        values[4] = CStringGetTextDatum(buf.data);
-                        nulls[4] = false;
                     }
                     else
                     {
                         xlog_decode_insert(relation, header, tup_desc, slot, &buf, nspname);
-                        values[4] = CStringGetTextDatum(buf.data);
-                        nulls[4] = false;
                     }
+
+                    values[4] = CStringGetTextDatum(buf.data);
+                    nulls[4] = false;
 
                     DecrTupleDescRefCount(tup_desc);
                     table_close(relation, AccessShareLock);
@@ -797,6 +803,128 @@ static void xlog_decode_insert(Relation relation, HeapTupleHeader header, TupleD
         }
     }
     appendStringInfo(buf, ");");
+}
+
+static void xlog_decode_update(Relation relation, HeapTuple tup, TupleDesc tup_desc, TupleTableSlot *slot, StringInfoData *buf, char *nspname)
+{
+    int index, num_restarts;
+    StringInfoData buf1;
+    Bitmapset *key_attrs;
+    HeapTupleHeader header = tup->t_data;
+    bool prev_exists;
+
+    initStringInfo(buf);
+    appendStringInfo(buf, "UPDATE %s SET ", quote_qualified_identifier(nspname, RelationGetRelationName(relation)));
+    num_restarts = 0;
+
+    {
+        prev_exists = false;
+        for (size_t attnum = 0; attnum < tup_desc->natts; attnum++)
+        {
+            Form_pg_attribute thisatt = TupleDescAttr(tup_desc, attnum);
+            if (thisatt->atttypid == InvalidOid)
+                continue;
+
+            if (!slot->tts_isnull[attnum])
+            {
+                if (prev_exists)
+                {
+                    appendStringInfo(buf, ", ");
+                }
+
+                appendStringInfo(buf, "%s=", NameStr(thisatt->attname));
+                build_string(header, thisatt, buf, slot->tts_values[attnum]);
+                prev_exists = true;
+            }
+        }
+    }
+
+    initStringInfo(&buf1);
+
+restart:
+    if (!RelationGetForm(relation)->relhasindex || num_restarts > 0)
+    {
+        prev_exists = false;
+        for (size_t attnum = 0; attnum < tup_desc->natts; attnum++)
+        {
+            Form_pg_attribute thisatt = TupleDescAttr(tup_desc, attnum);
+            if (thisatt->atttypid == InvalidOid)
+                continue;
+
+            if (!slot->tts_isnull[attnum])
+            {
+                if (prev_exists)
+                {
+                    appendStringInfo(&buf1, " AND ");
+                }
+
+                appendStringInfo(&buf1, "%s=", NameStr(thisatt->attname));
+                build_string(header, thisatt, &buf1, slot->tts_values[attnum]);
+                prev_exists = true;
+            }
+        }
+    }
+    else
+    {
+        key_attrs = RelationGetIndexAttrBitmap(relation, INDEX_ATTR_BITMAP_PRIMARY_KEY);
+        index = -1;
+
+        prev_exists = false;
+        while ((index = bms_next_member(key_attrs, index)) >= 0)
+        {
+            AttrNumber attnum = index + FirstLowInvalidHeapAttributeNumber;
+            char *attname;
+            Form_pg_attribute thisatt;
+
+            attname = get_attname(RelationGetRelid(relation), attnum, true);
+            if (!attname)
+                continue;
+
+            attnum = get_attnum(RelationGetRelid(relation), attname);
+
+            if (attnum == InvalidAttrNumber)
+            {
+                pfree(attname);
+                bms_free(key_attrs);
+                elog(ERROR, "cache lookup failed for attribute %s of relation %u", attname, RelationGetRelid(relation));
+            }
+
+            thisatt = TupleDescAttr(tup_desc, attnum - 1);
+
+            if (thisatt->atttypid == InvalidOid)
+                continue;
+
+            if (!slot->tts_isnull[attnum - 1])
+            {
+                Datum temp = slot->tts_values[attnum - 1];
+                if (prev_exists)
+                    appendStringInfo(&buf1, " AND ");
+
+                appendStringInfo(&buf1, "%s=", attname);
+                build_string(header, thisatt, &buf1, temp);
+                prev_exists = true;
+            }
+            pfree(attname);
+        }
+        bms_free(key_attrs);
+    }
+
+    if (buf1.len)
+        appendStringInfo(buf, " WHERE %s;", buf1.data);
+    else
+    {
+        /*
+         *   This is a hack check to ensure we don't accidentally get DELETE queries that
+         *   can wipe out the whole table e.g DELETE FROM pg_depend. If the first pass fails(with indexes),
+         *   we try a second time without the indexes
+         */
+        if (RelationGetForm(relation)->relhasindex && num_restarts < 2)
+        {
+            num_restarts++;
+            goto restart;
+        }
+        appendStringInfo(buf, ";");
+    }
 }
 
 PG_FUNCTION_INFO_V1(pg_xlog_records);
