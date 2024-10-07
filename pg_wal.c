@@ -19,6 +19,7 @@
 #include "access/relation.h"
 #include "access/skey.h"
 #include "access/table.h"
+#include "catalog/pg_constraint.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_type.h"
 #include "common/logging.h"
@@ -35,6 +36,7 @@ PG_MODULE_MAGIC;
 
 static int file_fd;
 static HTAB *page_cache_hash, *table_cache_hash;
+char TOAST_TABLE_NAME[] = "pg_toast";
 
 #define CHECK_NEXT_ATTR(tup_desc, attnum, is_null) ( \
     (attnum + 1) < (tup_desc->natts) && (!is_null[attnum + 1]))
@@ -257,7 +259,8 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
                     classForm = (Form_pg_class)GETSTRUCT(tuple);
                     if (classForm->relkind == RELKIND_INDEX ||
                         classForm->relkind == RELKIND_PARTITIONED_INDEX ||
-                        classForm->relkind == RELKIND_COMPOSITE_TYPE)
+                        classForm->relkind == RELKIND_COMPOSITE_TYPE ||
+                        classForm->oid == IndexRelationId || classForm->oid == ConstraintRelationId)
                     {
                         systable_endscan(sscan);
                         goto cleanup;
@@ -273,6 +276,20 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
                 }
 
                 relation = table_open(classForm->oid, AccessShareLock);
+                if (RelationIsVisible(RelationGetRelid(relation)))
+                    nspname = NULL;
+                else
+                    nspname = get_namespace_name(relation->rd_rel->relnamespace);
+
+                /* We ignore toast relations */
+                if (nspname && memcmp(nspname, TOAST_TABLE_NAME, 8) == 0)
+                {
+                    if (sscan)
+                        systable_endscan(sscan);
+                    table_close(relation, AccessShareLock);
+                    goto cleanup;
+                }
+
                 values[0] = Int32GetDatum(bkp_blk->blkno);
                 values[1] = TransactionIdGetDatum(xid);
                 values[2] = CStringGetTextDatum(temp_type);
@@ -364,11 +381,6 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
                     }
 
                     slot->tts_ops->getsomeattrs(slot, tup_desc->natts);
-
-                    if (RelationIsVisible(RelationGetRelid(relation)))
-                        nspname = NULL;
-                    else
-                        nspname = get_namespace_name(relation->rd_rel->relnamespace);
 
                     if (info == XLOG_HEAP_UPDATE)
                     {
@@ -538,7 +550,11 @@ start:
         return NULL;
     }
 
+#if PG_MAJORVERSION_NUM >= 17
+    decoded = XLogReadRecordAlloc(xlogreader, rec_len, true);
+#elif PG_MAJORVERSION_NUM <= 16
     decoded = XLogReadRecordAlloc(xlogreader, rec_len, false);
+#endif
     if (!decoded)
     {
         ereport(ERROR,
@@ -638,9 +654,10 @@ static void build_string(HeapTupleHeader header, Form_pg_attribute thisatt, Stri
     }
     else
     {
+        char *data = DatumGetPointer(field_val);
+
         if (thisatt->atttypid == TEXTOID)
         {
-            char *data = DatumGetPointer(field_val);
             struct varlena *val;
             if ((header->t_infomask & HEAP_HASVARWIDTH) != 0)
             {
@@ -651,6 +668,10 @@ static void build_string(HeapTupleHeader header, Form_pg_attribute thisatt, Stri
             {
                 appendStringInfo(buf, "%s", data);
             }
+        }
+        else
+        {
+            appendStringInfo(buf, "%s", data);
         }
     }
 }
