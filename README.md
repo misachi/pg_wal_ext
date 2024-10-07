@@ -1,9 +1,7 @@
 # pg_wal_ext
 Read WAL files and generate SQL from WAL
 
-~~Developed and tested on Postgres v17 which was compiled from source -- I will be working on testing it on PG16 as well🤞🏾~~
-
-The extension has been ran on Postgres v16(both compiled from source and other from Ubuntu/APT upstream packages) and Postgres v17(compiled from source)
+The extension has been ran on Postgres v16(both compiled from source and other from Ubuntu/APT upstream packages). PG17 still has an issue with the hash table implementation.
 
 A Postgres extension to read logged WAL records and attempt to decode the records and generate SQL for DML operations. One possible use case would be for database restoration(has limitations) or audit purposes.
 
