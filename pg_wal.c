@@ -35,7 +35,7 @@
 PG_MODULE_MAGIC;
 
 static int file_fd;
-static HTAB *page_cache_hash, *table_cache_hash;
+static HTAB *page_cache_hash;
 char TOAST_TABLE_NAME[] = "pg_toast";
 
 #define CHECK_NEXT_ATTR(tup_desc, attnum, is_null) ( \
@@ -168,16 +168,12 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
     uint8 info, info2;
     xl_xact_commit *xlrec;
     Relation rel_rel;
-    HASHCTL page_ctl, table_ctl;
+    HASHCTL page_ctl;
 
     page_ctl.keysize = sizeof(RelFileLocator);
     page_ctl.entrysize = sizeof(CachedPage);
 
-    table_ctl.keysize = sizeof(RelFileLocator);
-    table_ctl.entrysize = sizeof(TableCache);
-
     page_cache_hash = hash_create("page cache", 1024, &page_ctl, HASH_ELEM | HASH_STRINGS);
-    table_cache_hash = hash_create("table cache", 1024, &table_ctl, HASH_ELEM | HASH_STRINGS);
 
     InitMaterializedSRF(fcinfo, 0);
 
@@ -235,61 +231,33 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
                 Form_pg_class classForm = NULL;
                 HeapTuple tuple = NULL;
                 CachedPage *page_hentry;
-                TableCache *table_hentry;
 
                 bkp_blk = &xlog_reader->record->blocks[0];
 
-                table_hentry = (TableCache *)hash_search(table_cache_hash, &bkp_blk->rlocator, HASH_FIND, NULL);
-                if (!table_hentry)
+                ScanKeyInit(&skey,
+                            Anum_pg_class_relfilenode,
+                            BTEqualStrategyNumber, F_OIDEQ,
+                            ObjectIdGetDatum(bkp_blk->rlocator.relNumber));
+                sscan = systable_beginscan(rel_rel, ClassTblspcRelfilenodeIndexId, true,
+                                           NULL, 1, &skey);
+
+                tuple = systable_getnext(sscan);
+                if (!HeapTupleIsValid(tuple))
                 {
-                    ScanKeyInit(&skey,
-                                Anum_pg_class_relfilenode,
-                                BTEqualStrategyNumber, F_OIDEQ,
-                                ObjectIdGetDatum(bkp_blk->rlocator.relNumber));
-                    sscan = systable_beginscan(rel_rel, ClassTblspcRelfilenodeIndexId, true,
-                                               NULL, 1, &skey);
-
-                    tuple = systable_getnext(sscan);
-                    if (!HeapTupleIsValid(tuple))
-                    {
-                        systable_endscan(sscan);
-                        goto cleanup;
-                    }
-
-                    classForm = (Form_pg_class)GETSTRUCT(tuple);
-                    if (classForm->relkind == RELKIND_INDEX ||
-                        classForm->relkind == RELKIND_PARTITIONED_INDEX ||
-                        classForm->relkind == RELKIND_COMPOSITE_TYPE ||
-                        classForm->oid == IndexRelationId || classForm->oid == ConstraintRelationId)
-                    {
-                        systable_endscan(sscan);
-                        goto cleanup;
-                    }
-
-                    table_hentry = (TableCache *)hash_search(table_cache_hash, &bkp_blk->rlocator, HASH_ENTER, NULL);
-                    table_hentry->rlocator = bkp_blk->rlocator;
-                    table_hentry->tuple = classForm;
-                }
-                else
-                {
-                    classForm = table_hentry->tuple;
-                }
-
-                relation = table_open(classForm->oid, AccessShareLock);
-                if (RelationIsVisible(RelationGetRelid(relation)))
-                    nspname = NULL;
-                else
-                    nspname = get_namespace_name(relation->rd_rel->relnamespace);
-
-                /* We ignore toast relations */
-                if (nspname && memcmp(nspname, TOAST_TABLE_NAME, 8) == 0)
-                {
-                    if (sscan)
-                        systable_endscan(sscan);
-                    table_close(relation, AccessShareLock);
+                    systable_endscan(sscan);
                     goto cleanup;
                 }
 
+                classForm = (Form_pg_class)GETSTRUCT(tuple);
+                if (classForm->relkind == RELKIND_INDEX ||
+                    classForm->relkind == RELKIND_PARTITIONED_INDEX ||
+                    classForm->relkind == RELKIND_COMPOSITE_TYPE)
+                {
+                    systable_endscan(sscan);
+                    goto cleanup;
+                }
+
+                relation = table_open(classForm->oid, AccessShareLock);
                 values[0] = Int32GetDatum(bkp_blk->blkno);
                 values[1] = TransactionIdGetDatum(xid);
                 values[2] = CStringGetTextDatum(temp_type);
@@ -337,7 +305,7 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
                         else
                         {
                             page_hentry = (CachedPage *)hash_search(page_cache_hash, &bkp_blk->rlocator, HASH_FIND, NULL);
-                            if (page_hentry)
+                            if(page_hentry)
                             {
                                 page = page_hentry->entry;
                             }
@@ -345,8 +313,7 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
                             {
                                 DecrTupleDescRefCount(tup_desc);
                                 table_close(relation, AccessShareLock);
-                                if (sscan)
-                                    systable_endscan(sscan);
+                                systable_endscan(sscan);
                                 goto cleanup;
                             }
                         }
@@ -381,6 +348,11 @@ static void xlog_saved_info(XLogReaderState *xlog_reader, FunctionCallInfo fcinf
                     }
 
                     slot->tts_ops->getsomeattrs(slot, tup_desc->natts);
+
+                    if (RelationIsVisible(RelationGetRelid(relation)))
+                        nspname = NULL;
+                    else
+                        nspname = get_namespace_name(relation->rd_rel->relnamespace);
 
                     if (info == XLOG_HEAP_UPDATE)
                     {
@@ -819,7 +791,60 @@ static void xlog_decode_insert(Relation relation, HeapTupleHeader header, TupleD
                 appendStringInfo(buf, ",");
             }
 
-            build_string(header, thisatt, buf, slot->tts_values[attnum]);
+            if (thisatt->attbyval)
+            {
+                switch (thisatt->atttypid)
+                {
+                case BOOLOID:
+                    appendStringInfo(buf, "%c", DatumGetBool(slot->tts_values[attnum]) == 1 ? 't' : 'f');
+                    break;
+                case CHAROID:
+                    appendStringInfo(buf, "%c", DatumGetChar(slot->tts_values[attnum]));
+                    break;
+                case INT2OID:
+                    appendStringInfo(buf, "%i", DatumGetInt16(slot->tts_values[attnum]));
+                    break;
+                case INT4OID:
+                case OIDOID:
+                case XIDOID:
+                case CIDOID:
+                    appendStringInfo(buf, "%i", DatumGetInt32(slot->tts_values[attnum]));
+                    break;
+                case INT8OID:
+                    appendStringInfo(buf, "%ld", DatumGetInt64(slot->tts_values[attnum]));
+                    break;
+                case FLOAT4OID:
+                    appendStringInfo(buf, "%f", DatumGetFloat4(slot->tts_values[attnum]));
+                    break;
+                case FLOAT8OID:
+                    appendStringInfo(buf, "%f", DatumGetFloat8(slot->tts_values[attnum]));
+                    break;
+                default:
+                    appendStringInfo(buf, "%zu", DatumGetInt64(slot->tts_values[attnum]));
+                }
+            }
+            else
+            {
+                if (thisatt->atttypid == TEXTOID)
+                {
+                    char *data = DatumGetPointer(slot->tts_values[attnum]);
+                    struct varlena *val;
+                    if ((header->t_infomask & HEAP_HASVARWIDTH) != 0)
+                    {
+                        val = (struct varlena *)data;
+                        appendStringInfo(buf, "'%s'", text_to_cstring(val));
+                    }
+                    else
+                    {
+                        appendStringInfo(buf, "%s", data);
+                    }
+                }
+                else
+                {
+                    char *data = DatumGetCString(slot->tts_values[attnum]);
+                    appendStringInfo(buf, "%s", data);
+                }
+            }
             prev_exists = true;
         }
     }
